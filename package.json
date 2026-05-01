@@ -1,0 +1,16 @@
+{
+  "name": "mr-francis-ball-websocket-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Render-hosted WebSocket relay for Mr Francis Ball multiplayer.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
