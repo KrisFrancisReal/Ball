@@ -285,6 +285,7 @@ function handlePaddle(ws, data) {
     vx: player.paddle.vx,
     vy: player.paddle.vy,
     serve: !!data.serve,
+    boost: !!data.boost,
     seq: Number(data.seq) || 0
   });
 }
@@ -300,6 +301,16 @@ function handleGameState(ws, data) {
   lobby.state = state;
   lobby.updatedAt = Date.now();
   sendToOpponent(ws, { type: 'gameState', state });
+}
+
+function handleReplay(ws) {
+  const { lobby, player } = currentPlayer(ws);
+  if (!lobby || !player) return;
+  lobby.state = null;
+  lobby.updatedAt = Date.now();
+  for (const p of lobby.players) {
+    send(p.ws, { type: 'replay', requestedBy: player.role, lobby: publicLobby(lobby) });
+  }
 }
 
 function handleMessage(ws, raw) {
@@ -332,6 +343,9 @@ function handleMessage(ws, raw) {
       break;
     case 'gameState':
       handleGameState(ws, data);
+      break;
+    case 'replay':
+      handleReplay(ws);
       break;
     case 'leave':
       leaveCurrentLobby(ws, 'left');
