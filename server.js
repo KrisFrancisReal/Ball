@@ -293,6 +293,19 @@ function cleanNumber(value, fallback = 0, min = -5000, max = 5000) {
   return Math.max(min, Math.min(max, n));
 }
 
+function cleanBallPayload(ball) {
+  return {
+    x: cleanNumber(ball && ball.x),
+    y: cleanNumber(ball && ball.y),
+    z: cleanNumber(ball && ball.z, 0, -1000, 3000),
+    vx: cleanNumber(ball && ball.vx),
+    vy: cleanNumber(ball && ball.vy),
+    vz: cleanNumber(ball && ball.vz),
+    spinX: cleanNumber(ball && ball.spinX),
+    spinY: cleanNumber(ball && ball.spinY)
+  };
+}
+
 function handlePaddle(ws, data) {
   const { lobby, player } = currentPlayer(ws);
   if (!lobby || !player) return;
@@ -334,16 +347,8 @@ function handleHitClaim(ws, data) {
       vx: cleanNumber(data.paddle && data.paddle.vx),
       vy: cleanNumber(data.paddle && data.paddle.vy)
     },
-    ball: {
-      x: cleanNumber(data.ball && data.ball.x),
-      y: cleanNumber(data.ball && data.ball.y),
-      z: cleanNumber(data.ball && data.ball.z, 0, -1000, 3000),
-      vx: cleanNumber(data.ball && data.ball.vx),
-      vy: cleanNumber(data.ball && data.ball.vy),
-      vz: cleanNumber(data.ball && data.ball.vz),
-      spinX: cleanNumber(data.ball && data.ball.spinX),
-      spinY: cleanNumber(data.ball && data.ball.spinY)
-    }
+    ball: cleanBallPayload(data.ball),
+    postBall: cleanBallPayload(data.postBall)
   });
 }
 
