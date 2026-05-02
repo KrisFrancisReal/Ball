@@ -13,11 +13,28 @@ const PLAYER_LIMIT = 2;
 
 const CONFIG = {
   court: { width: 800, height: 560, depth: 1800 },
-  ball: { radius: 26, spinDecay: 0.985, maxSpeed: 1900, initialZSpeed: 700, serveSpeedMultiplier: 0.94 },
+  // serveSpeedMultiplier raised 0.94 -> 1.10 so multiplayer serves match the
+  // punch of a single-player level-3 serve instead of feeling like level 1.
+  ball: { radius: 26, spinDecay: 0.985, maxSpeed: 1900, initialZSpeed: 700, serveSpeedMultiplier: 1.10, serveZ: 60 },
   paddle: { width: 170, height: 130 },
   scoreOverlayMs: 3000,
   scoreFadeMs: 450,
   timing: { playerBoostMultiplier: 1.065 },
+  shot: {
+    hitGain: 1.04,
+    serveEdgeKick: 310,
+    hitEdgeKick: 320,
+    hitEdgeBonus: 160,
+    serveMoveKick: 0.40,
+    hitMoveKick: 0.42,
+    incomingDeflect: -0.045,
+    glancingControlLoss: 0.16,
+    serveSpinFromEdge: 390,
+    hitSpinFromEdge: 520,
+    serveSpinFromSwipe: 0.82,
+    hitSpinFromSwipe: 1.05,
+    maxSpin: 2600
+  },
   network: {
     remotePaddleSlack: 18,
     hitClaimGraceMs: 240,
@@ -25,7 +42,7 @@ const CONFIG = {
     hitClaimBallDriftLimit: 440,
     hitClaimValidateSlack: 68
   },
-  physics: { substepThreshold: 18 }
+  physics: { substepThreshold: 16 }
 };
 
 let nextGameNumber = 1;
@@ -109,7 +126,7 @@ function cloneBall(ball) {
   return {
     x: Number(ball && ball.x) || 0,
     y: Number(ball && ball.y) || 0,
-    z: Number(ball && ball.z) || 70,
+    z: Number(ball && ball.z) || CONFIG.ball.serveZ,
     vx: Number(ball && ball.vx) || 0,
     vy: Number(ball && ball.vy) || 0,
     vz: Number(ball && ball.vz) || 0,
@@ -122,7 +139,7 @@ function cleanBallPayload(ball) {
   return {
     x: cleanNumber(ball && ball.x),
     y: cleanNumber(ball && ball.y),
-    z: cleanNumber(ball && ball.z, 70, -1000, 3000),
+    z: cleanNumber(ball && ball.z, CONFIG.ball.serveZ, -1000, 3000),
     vx: cleanNumber(ball && ball.vx),
     vy: cleanNumber(ball && ball.vy),
     vz: cleanNumber(ball && ball.vz),
@@ -291,7 +308,7 @@ function parkServeBall(lobby) {
   const ball = lobby.state.ball;
   ball.x = 0;
   ball.y = 0;
-  ball.z = role === 'guest' ? CONFIG.court.depth - 70 : 70;
+  ball.z = role === 'guest' ? CONFIG.court.depth - CONFIG.ball.serveZ : CONFIG.ball.serveZ;
   ball.vx = 0;
   ball.vy = 0;
   ball.vz = 0;
@@ -330,21 +347,23 @@ function applyPaddleShot(ball, role, isServe, contact) {
   const incomingVX = isServe ? 0 : ball.vx;
   const incomingVY = isServe ? 0 : ball.vy;
 
-  const edgeKick = isServe ? 310 : 320 + contact.edge * 160;
-  const moveKick = isServe ? 0.40 : 0.42;
-  const incomingDeflect = isServe ? 0 : contact.edge * -0.045;
-  const controlLoss = 1 - contact.glancing * 0.16;
+  const edgeKick = isServe
+    ? CONFIG.shot.serveEdgeKick
+    : CONFIG.shot.hitEdgeKick + contact.edge * CONFIG.shot.hitEdgeBonus;
+  const moveKick = isServe ? CONFIG.shot.serveMoveKick : CONFIG.shot.hitMoveKick;
+  const incomingDeflect = isServe ? 0 : contact.edge * CONFIG.shot.incomingDeflect;
+  const controlLoss = 1 - contact.glancing * CONFIG.shot.glancingControlLoss;
   ball.vx = (ball.vx + contact.offsetX * edgeKick + cappedVX * moveKick + incomingVX * incomingDeflect) * controlLoss;
   ball.vy = (ball.vy + contact.offsetY * edgeKick + cappedVY * moveKick + incomingVY * incomingDeflect) * controlLoss;
 
   const acrossX = cappedVX - incomingVX * 0.18;
   const acrossY = cappedVY - incomingVY * 0.18;
-  const spinFromEdge = isServe ? 390 : 520;
-  const spinFromSwipe = isServe ? 0.82 : 1.05;
+  const spinFromEdge = isServe ? CONFIG.shot.serveSpinFromEdge : CONFIG.shot.hitSpinFromEdge;
+  const spinFromSwipe = isServe ? CONFIG.shot.serveSpinFromSwipe : CONFIG.shot.hitSpinFromSwipe;
   ball.spinX += contact.offsetX * spinFromEdge + acrossX * spinFromSwipe;
   ball.spinY += contact.offsetY * spinFromEdge + acrossY * spinFromSwipe;
-  ball.spinX = clamp(ball.spinX, -2600, 2600);
-  ball.spinY = clamp(ball.spinY, -2600, 2600);
+  ball.spinX = clamp(ball.spinX, -CONFIG.shot.maxSpin, CONFIG.shot.maxSpin);
+  ball.spinY = clamp(ball.spinY, -CONFIG.shot.maxSpin, CONFIG.shot.maxSpin);
   clampBallSpeed(ball);
 }
 
@@ -365,7 +384,7 @@ function applyPaddleHit(lobby, role, contact) {
   const r = Math.max(CONFIG.ball.radius, ballVisualWorldRadius(0));
   ball.z = role === 'guest' ? CONFIG.court.depth - r : r;
   ball.vz = Math.abs(ball.vz) * dir;
-  const gain = 1.04;
+  const gain = CONFIG.shot.hitGain;
   ball.vx *= gain;
   ball.vy *= gain;
   ball.vz *= gain;
@@ -390,7 +409,7 @@ function launchServe(lobby, role) {
   if (!contact.overlaps) return;
   const ball = lobby.state.ball;
   const dir = role === 'guest' ? -1 : 1;
-  ball.z = role === 'guest' ? CONFIG.court.depth - 70 : 70;
+  ball.z = role === 'guest' ? CONFIG.court.depth - CONFIG.ball.serveZ : CONFIG.ball.serveZ;
   ball.vz = CONFIG.ball.initialZSpeed * CONFIG.ball.serveSpeedMultiplier * dir;
   ball.vx = 0;
   ball.vy = 0;
