@@ -317,6 +317,36 @@ function handlePaddle(ws, data) {
   });
 }
 
+function handleHitClaim(ws, data) {
+  const { lobby, player } = currentPlayer(ws);
+  if (!lobby || !player) return;
+  player.lastSeen = Date.now();
+  lobby.updatedAt = player.lastSeen;
+  sendToOpponent(ws, {
+    type: 'hitClaim',
+    role: player.role,
+    claimSeq: Number(data.claimSeq) || 0,
+    stateSeq: Number(data.stateSeq) || 0,
+    boost: !!data.boost,
+    paddle: {
+      x: cleanNumber(data.paddle && data.paddle.x),
+      y: cleanNumber(data.paddle && data.paddle.y),
+      vx: cleanNumber(data.paddle && data.paddle.vx),
+      vy: cleanNumber(data.paddle && data.paddle.vy)
+    },
+    ball: {
+      x: cleanNumber(data.ball && data.ball.x),
+      y: cleanNumber(data.ball && data.ball.y),
+      z: cleanNumber(data.ball && data.ball.z, 0, -1000, 3000),
+      vx: cleanNumber(data.ball && data.ball.vx),
+      vy: cleanNumber(data.ball && data.ball.vy),
+      vz: cleanNumber(data.ball && data.ball.vz),
+      spinX: cleanNumber(data.ball && data.ball.spinX),
+      spinY: cleanNumber(data.ball && data.ball.spinY)
+    }
+  });
+}
+
 function handleGameState(ws, data) {
   const { lobby, player } = currentPlayer(ws);
   if (!lobby || !player || player.role !== 'host') return;
@@ -367,6 +397,9 @@ function handleMessage(ws, raw) {
       break;
     case 'paddle':
       handlePaddle(ws, data);
+      break;
+    case 'hitClaim':
+      handleHitClaim(ws, data);
       break;
     case 'gameState':
       handleGameState(ws, data);
