@@ -37,6 +37,17 @@ function randomPin() {
   return String(min + Math.floor(Math.random() * (max - min + 1)));
 }
 
+function cleanWinScore(value) {
+  const n = Math.floor(Number(value));
+  if (!Number.isFinite(n)) return 10;
+  return Math.max(1, Math.min(99, n));
+}
+
+function cleanHostColour(value) {
+  const colour = String(value || '').toLowerCase();
+  return colour === 'red' || colour === 'blue' ? colour : null;
+}
+
 function send(ws, payload) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(JSON.stringify(payload));
@@ -59,6 +70,8 @@ function publicLobby(lobby) {
     status: lobbyStatus(lobby),
     playerCount: lobby.players.length,
     hostColour: lobby.hostColour || null,
+    isPublic: !!lobby.isPublic,
+    winScore: cleanWinScore(lobby.winScore),
     createdAt: lobby.createdAt,
     updatedAt: lobby.updatedAt,
     state: lobby.state || null,
@@ -80,6 +93,8 @@ function lobbyList() {
       gameNumber: lobby.gameNumber,
       status: lobbyStatus(lobby),
       playerCount: lobby.players.length,
+      isPublic: !!lobby.isPublic,
+      winScore: cleanWinScore(lobby.winScore),
       createdAt: lobby.createdAt,
       updatedAt: lobby.updatedAt
     }));
@@ -131,7 +146,10 @@ function maybeStartLobby(lobby) {
       type: 'startGame',
       lobby: publicState,
       role: player.role,
-      colour: player.colour
+      colour: player.colour,
+      pin: lobby.isPublic ? null : lobby.pin,
+      isPublic: !!lobby.isPublic,
+      winScore: cleanWinScore(lobby.winScore)
     });
   }
   broadcastLobbyList();
@@ -171,14 +189,18 @@ function leaveCurrentLobby(ws, reason = 'left') {
   broadcastLobbyList();
 }
 
-function handleCreateLobby(ws) {
+function handleCreateLobby(ws, data = {}) {
   leaveCurrentLobby(ws, 'new lobby');
+  const isPublic = data.isPublic !== false;
+  const hostColour = cleanHostColour(data.hostColour);
   const lobby = {
     lobbyId: randomId(8),
     gameNumber: nextGameNumber++,
-    pin: randomPin(),
+    pin: isPublic ? null : randomPin(),
+    isPublic,
+    winScore: cleanWinScore(data.winScore),
     players: [],
-    hostColour: null,
+    hostColour,
     status: 'waiting',
     state: null,
     createdAt: Date.now(),
@@ -188,7 +210,7 @@ function handleCreateLobby(ws) {
     ws,
     role: 'host',
     token: randomId(16),
-    colour: null,
+    colour: hostColour,
     paddle: { x: 0, y: 0, vx: 0, vy: 0 },
     lastSeen: Date.now()
   };
@@ -203,6 +225,8 @@ function handleCreateLobby(ws) {
     lobbyId: lobby.lobbyId,
     gameNumber: lobby.gameNumber,
     pin: lobby.pin,
+    isPublic: !!lobby.isPublic,
+    winScore: cleanWinScore(lobby.winScore),
     role: 'host',
     token: host.token
   });
@@ -215,7 +239,7 @@ function handleJoinLobby(ws, data) {
   const lobby = [...lobbies.values()].find((item) => item.gameNumber === gameNumber);
   if (!lobby) return sendError(ws, 'Game not found');
   if (lobby.players.length >= PLAYER_LIMIT) return sendError(ws, 'Lobby is full');
-  if (pin !== lobby.pin) return sendError(ws, 'Wrong PIN');
+  if (!lobby.isPublic && pin !== lobby.pin) return sendError(ws, 'Wrong PIN');
 
   leaveCurrentLobby(ws, 'joining lobby');
   const guest = {
@@ -236,6 +260,9 @@ function handleJoinLobby(ws, data) {
     lobby: publicLobby(lobby),
     lobbyId: lobby.lobbyId,
     gameNumber: lobby.gameNumber,
+    pin: lobby.isPublic ? null : lobby.pin,
+    isPublic: !!lobby.isPublic,
+    winScore: cleanWinScore(lobby.winScore),
     role: 'guest',
     token: guest.token
   });
@@ -330,7 +357,7 @@ function handleMessage(ws, raw) {
       send(ws, { type: 'lobbyList', lobbies: lobbyList() });
       break;
     case 'createLobby':
-      handleCreateLobby(ws);
+      handleCreateLobby(ws, data);
       break;
     case 'joinLobby':
       handleJoinLobby(ws, data);
