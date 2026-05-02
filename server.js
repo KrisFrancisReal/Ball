@@ -245,11 +245,24 @@ function broadcastLobby(lobby, extra = {}) {
 function broadcastState(lobby, force = false) {
   if (!lobby || !lobby.state) return;
   const now = Date.now();
-  if (!force && now - (lobby.lastBroadcastAt || 0) < STATE_BROADCAST_MS) return;
-  lobby.lastBroadcastAt = now;
+  // Bump seq once per call. Each call corresponds to one logical state
+  // version; a player who is gated for this tick will see seq jumps but
+  // their reconciler tolerates that fine. Per-player gating below means a
+  // 30 Hz mobile client doesn't get hammered with 62.5 Hz snapshots.
   lobby.state.seq = (lobby.state.seq || 0) + 1;
   const payload = { type: 'gameState', state: serializeState(lobby.state) };
-  for (const player of lobby.players) send(player.ws, payload);
+  // Track lobby-wide broadcast time too, for any external code that may
+  // want it (and so the previous behavior is unchanged when no player has
+  // declared a custom interval).
+  let anySent = false;
+  for (const player of lobby.players) {
+    const interval = player.broadcastIntervalMs || STATE_BROADCAST_MS;
+    if (!force && now - (player.lastBroadcastAt || 0) < interval) continue;
+    player.lastBroadcastAt = now;
+    send(player.ws, payload);
+    anySent = true;
+  }
+  if (anySent) lobby.lastBroadcastAt = now;
 }
 
 function currentPlayer(ws) {
@@ -810,6 +823,17 @@ function handleGameState(ws, data) {
   void data;
 }
 
+// Client declares its desired snapshot interval. Mobile clients running at
+// ~30 Hz can ask the server to throttle to that rate, halving network and
+// reconciliation overhead. Defaults clamped to [16, 200] ms (62.5–5 Hz).
+function handleClientHello(ws, data) {
+  const { player } = currentPlayer(ws);
+  if (!player) return;
+  const requested = Math.floor(Number(data && data.intervalMs));
+  if (!Number.isFinite(requested)) return;
+  player.broadcastIntervalMs = Math.max(16, Math.min(200, requested));
+}
+
 function handleReplay(ws) {
   const { lobby, player } = currentPlayer(ws);
   if (!lobby || !player) return;
@@ -854,6 +878,9 @@ function handleMessage(ws, raw) {
     case 'gameState':
       handleGameState(ws, data);
       break;
+    case 'clientHello':
+      handleClientHello(ws, data);
+      break;
     case 'replay':
       handleReplay(ws);
       break;
@@ -862,7 +889,9 @@ function handleMessage(ws, raw) {
       send(ws, { type: 'leftLobby' });
       break;
     case 'ping':
-      send(ws, { type: 'pong', t: Date.now() });
+      // Echo the client's timestamp so it can measure true round-trip time.
+      // Falls back to server time for older clients that didn't send `t`.
+      send(ws, { type: 'pong', t: Number(data.t) || Date.now(), serverTime: Date.now() });
       break;
     default:
       sendError(ws, 'Unknown message type');
