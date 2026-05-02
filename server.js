@@ -24,7 +24,8 @@ const CONFIG = {
     hitClaimZWindow: 280,
     hitClaimBallDriftLimit: 440,
     hitClaimValidateSlack: 68
-  }
+  },
+  physics: { substepThreshold: 18 }
 };
 
 let nextGameNumber = 1;
@@ -363,7 +364,7 @@ function applyPaddleHit(lobby, role, contact) {
   const dir = role === 'guest' ? -1 : 1;
   const r = Math.max(CONFIG.ball.radius, ballVisualWorldRadius(0));
   ball.z = role === 'guest' ? CONFIG.court.depth - r : r;
-  ball.vz = Math.max(360, Math.abs(ball.vz)) * dir;
+  ball.vz = Math.abs(ball.vz) * dir;
   const gain = 1.04;
   ball.vx *= gain;
   ball.vy *= gain;
@@ -431,7 +432,7 @@ function queuePotentialMiss(lobby, missedRole, scorerRole) {
   const dir = missedRole === 'guest' ? -1 : 1;
   const r = Math.max(CONFIG.ball.radius, ballVisualWorldRadius(0));
   ball.z = missedRole === 'guest' ? CONFIG.court.depth - r : r;
-  ball.vz = Math.max(360, Math.abs(ball.vz)) * dir;
+  ball.vz = Math.abs(ball.vz) * dir;
   ball.vx *= 0.985;
   ball.vy *= 0.985;
   clampBallSpeed(ball);
@@ -493,26 +494,9 @@ function subStepBall(lobby, dt) {
 
 function stepBall(lobby, dt) {
   const ball = lobby.state.ball;
-  const steps = Math.max(1, Math.ceil(ballSpeed(ball) * dt / 14));
+  const steps = Math.max(1, Math.ceil(ballSpeed(ball) * dt / CONFIG.physics.substepThreshold));
   const sub = dt / steps;
   for (let i = 0; i < steps; i++) subStepBall(lobby, sub);
-}
-
-function validClaimPostBall(postBall, role) {
-  if (!postBall || typeof postBall !== 'object') return null;
-  const ball = cloneBall(postBall);
-  const movingAway = role === 'guest' ? ball.vz < 0 : ball.vz > 0;
-  if (!movingAway) return null;
-  const r = Math.max(CONFIG.ball.radius, ballVisualWorldRadius(0));
-  const nearPlane = role === 'guest'
-    ? ball.z <= CONFIG.court.depth - r + CONFIG.network.hitClaimZWindow
-    : ball.z >= r - CONFIG.network.hitClaimZWindow;
-  if (!nearPlane || ballSpeed(ball) > CONFIG.ball.maxSpeed * 1.08) return null;
-  ball.x = clamp(ball.x, -CONFIG.court.width / 2, CONFIG.court.width / 2);
-  ball.y = clamp(ball.y, -CONFIG.court.height / 2, CONFIG.court.height / 2);
-  ball.z = clamp(ball.z, r, CONFIG.court.depth - r);
-  clampBallSpeed(ball);
-  return ball;
 }
 
 function acceptHitClaim(lobby, player, data) {
@@ -543,6 +527,11 @@ function acceptHitClaim(lobby, player, data) {
     ball.y = clamp(claimedBall.y, -CONFIG.court.height / 2, CONFIG.court.height / 2);
   }
   ball.z = plane;
+  ball.vx = claimedBall.vx;
+  ball.vy = claimedBall.vy;
+  ball.vz = claimedBall.vz;
+  ball.spinX = claimedBall.spinX;
+  ball.spinY = claimedBall.spinY;
   const contact = contactInfoFor(lobby, role, claimedPaddle, ball, CONFIG.network.hitClaimValidateSlack);
   if (!contact.overlaps) {
     Object.assign(ball, savedBall);
@@ -550,21 +539,8 @@ function acceptHitClaim(lobby, player, data) {
   }
 
   lobby.pendingMiss = null;
-  ball.vx = claimedBall.vx;
-  ball.vy = claimedBall.vy;
-  ball.spinX = claimedBall.spinX;
-  ball.spinY = claimedBall.spinY;
-  const incomingVz = Math.max(Math.abs(savedBall.vz), Math.abs(claimedBall.vz), 360);
-  ball.vz = incomingVz * (role === 'guest' ? 1 : -1);
-
-  const postBall = validClaimPostBall(data.postBall, role);
-  if (postBall) {
-    Object.assign(ball, postBall);
-  } else {
-    if (data.boost) player.boostUntil = Date.now() + 140;
-    applyPaddleHit(lobby, role, contact);
-  }
-  if (postBall) makeEvent(lobby, 'hit', role);
+  if (data.boost) player.boostUntil = Date.now() + 140;
+  applyPaddleHit(lobby, role, contact);
   return true;
 }
 
