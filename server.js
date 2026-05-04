@@ -41,7 +41,9 @@ const CONFIG = {
   },
   network: {
     serveContactSlack: 0,
-    sampledContactSlack: 10,
+    sampledContactSlack: 6,
+    maxInputAgeMs: 160,
+    paddlePredictionMs: 84,
     inputHistoryLimit: 8
   }
 };
@@ -99,7 +101,10 @@ function ballVisualWorldRadius(z) {
 }
 
 function humanPaddleHitRadius() {
-  return Math.max(CONFIG.ball.radius, ballVisualWorldRadius(0));
+  // Collision uses the real physics ball radius, not the enlarged perspective
+  // render radius. The near-camera ball can look dramatic without its glow
+  // acting like a huge invisible hitbox.
+  return CONFIG.ball.radius;
 }
 
 function makeBall(role = 'host') {
@@ -179,6 +184,7 @@ function cleanSamples(samples) {
   if (!Array.isArray(samples)) return [];
   return samples.slice(-CONFIG.network.inputHistoryLimit).map((sample) => ({
     t: cleanNumber(sample && sample.t, nowWall(), 0, 9999999999999),
+    serverTime: cleanNumber(sample && sample.serverTime, 0, 0, 9999999999999),
     x: cleanNumber(sample && sample.x),
     y: cleanNumber(sample && sample.y),
     vx: cleanNumber(sample && sample.vx, 0, -3200, 3200),
@@ -420,6 +426,23 @@ function sampledPaddlesFor(player) {
     clampPaddle(paddle);
     paddles.push(paddle);
   }
+  const speed = Math.sqrt(player.paddle.vx * player.paddle.vx + player.paddle.vy * player.paddle.vy);
+  const inputAge = clamp(nowWall() - (player.lastSeen || nowWall()), 0, CONFIG.network.maxInputAgeMs);
+  if (speed > 120 && inputAge <= CONFIG.network.maxInputAgeMs) {
+    const baseLead = clamp(inputAge + 24, 0, CONFIG.network.paddlePredictionMs);
+    const leads = [baseLead, Math.min(CONFIG.network.paddlePredictionMs, baseLead + 28)];
+    for (const lead of leads) {
+      const dt = lead / 1000;
+      const paddle = {
+        x: player.paddle.x + player.paddle.vx * dt,
+        y: player.paddle.y + player.paddle.vy * dt,
+        vx: player.paddle.vx,
+        vy: player.paddle.vy
+      };
+      clampPaddle(paddle);
+      paddles.push(paddle);
+    }
+  }
   return paddles;
 }
 
@@ -481,6 +504,7 @@ function applyPaddleHit(lobby, role, isServe, contact) {
     ball.vx = 0;
     ball.vy = 0;
     ball.vz = CONFIG.ball.initialZSpeed * dir;
+    ball.z = role === 'guest' ? CONFIG.court.depth - CONFIG.ball.serveZ : CONFIG.ball.serveZ;
     ball.spinX = 0;
     ball.spinY = 0;
   } else {
@@ -490,7 +514,7 @@ function applyPaddleHit(lobby, role, isServe, contact) {
     ball.vz *= CONFIG.shot.hitGain;
   }
   clampBallSpeed(ball);
-  applyPaddleShot(ball, player ? player.paddle : contact.paddle, !!isServe, contact);
+  applyPaddleShot(ball, contact.paddle, !!isServe, contact);
   if (!isServe && player) applyBoostIfReady(lobby, player);
 
   lobby.lastHitRole = role;
@@ -867,6 +891,7 @@ function handlePaddle(ws, data) {
   player.paddle = paddle;
   player.samples = cleanSamples(data.samples);
   player.lastSeen = nowWall();
+  player.lastInputServerTime = cleanNumber(data.inputServerTime, player.lastSeen, 0, 9999999999999);
   lobby.updatedAt = player.lastSeen;
 
   if (data.boost) player.boostUntil = nowWall() + CONFIG.timing.playerBoostWindowMs;
