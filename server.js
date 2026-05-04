@@ -40,7 +40,8 @@ const CONFIG = {
     maxSpin: 2600
   },
   network: {
-    contactSlack: 22,
+    serveContactSlack: 0,
+    sampledContactSlack: 10,
     inputHistoryLimit: 8
   }
 };
@@ -385,17 +386,51 @@ function contactInfo(ball, paddle, extraSlack = 0) {
   const hw = CONFIG.paddle.width / 2;
   const hh = CONFIG.paddle.height / 2;
   const r = humanPaddleHitRadius();
-  const outsideX = Math.max(0, Math.abs(dx) - hw);
-  const outsideY = Math.max(0, Math.abs(dy) - hh);
+  const closestX = clamp(dx, -hw, hw);
+  const closestY = clamp(dy, -hh, hh);
+  const sepX = dx - closestX;
+  const sepY = dy - closestY;
+  const outsideDistance = Math.sqrt(sepX * sepX + sepY * sepY);
+  const hitRadius = r + extraSlack;
   return {
     paddle,
     r,
-    overlaps: Math.abs(dx) <= hw + r + extraSlack && Math.abs(dy) <= hh + r + extraSlack,
+    overlaps: outsideDistance <= hitRadius,
+    closestX,
+    closestY,
+    outsideDistance,
     offsetX: clamp(dx / Math.max(1, hw), -1.25, 1.25),
     offsetY: clamp(dy / Math.max(1, hh), -1.25, 1.25),
     edge: clamp(Math.sqrt((dx / hw) * (dx / hw) + (dy / hh) * (dy / hh)) / 1.35, 0, 1),
-    glancing: clamp(Math.max(outsideX, outsideY) / Math.max(1, r), 0, 1)
+    glancing: clamp(outsideDistance / Math.max(1, hitRadius), 0, 1)
   };
+}
+
+function sampledPaddlesFor(player) {
+  const paddles = [clonePaddle(player.paddle)];
+  const samples = Array.isArray(player.samples) ? player.samples.slice(-CONFIG.network.inputHistoryLimit) : [];
+  for (let i = samples.length - 1; i >= 0; i--) {
+    const sample = samples[i];
+    const paddle = {
+      x: cleanNumber(sample.x),
+      y: cleanNumber(sample.y),
+      vx: cleanNumber(player.paddle.vx, 0, -3200, 3200),
+      vy: cleanNumber(player.paddle.vy, 0, -3200, 3200)
+    };
+    clampPaddle(paddle);
+    paddles.push(paddle);
+  }
+  return paddles;
+}
+
+function bestContactInfo(player, ball, extraSlack = 0) {
+  let best = null;
+  for (const paddle of sampledPaddlesFor(player)) {
+    const contact = contactInfo(ball, paddle, extraSlack);
+    if (!contact.overlaps) continue;
+    if (!best || contact.outsideDistance < best.outsideDistance) best = contact;
+  }
+  return best;
 }
 
 function applyPaddleShot(ball, paddle, isServe, contact) {
@@ -470,8 +505,11 @@ function tryPaddleHit(lobby, role, isServe = false) {
     lobby.lastHitRole === role &&
     lobby.simulationTime - (lobby.lastHitSimulationTime || 0) < 80;
   if (recentlySame) return false;
-  const contact = contactInfo(lobby.state.ball, player.paddle, CONFIG.network.contactSlack);
-  if (!contact.overlaps) return false;
+  const slack = isServe ? CONFIG.network.serveContactSlack : CONFIG.network.sampledContactSlack;
+  const contact = isServe
+    ? contactInfo(lobby.state.ball, player.paddle, slack)
+    : bestContactInfo(player, lobby.state.ball, slack);
+  if (!contact || !contact.overlaps) return false;
   applyPaddleHit(lobby, role, isServe, contact);
   return true;
 }
