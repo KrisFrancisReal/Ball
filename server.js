@@ -19,7 +19,7 @@ const PLAYER_LIMIT = 2;
 
 const CONFIG = {
   court: { width: 800, height: 560, depth: 1800 },
-  ball: { radius: 26, spinDecay: 0.985, maxSpeed: 1900, initialZSpeed: 700, serveZ: 60, hitCoreScale: 0.64 },
+  ball: { radius: 26, spinDecay: 0.985, maxSpeed: 1900, initialZSpeed: 700, serveZ: 60, hitCoreScale: 1.0 },
   paddle: { width: 170, height: 130 },
   physics: { substepThreshold: 18 },
   timing: { playerBoostWindowMs: 140, playerBoostMultiplier: 1.065 },
@@ -105,8 +105,8 @@ function humanPaddleHitRadius() {
 }
 
 function collisionWorldRadius(viewZ) {
-  // Use the solid visible ball core, not the outer glow. This matches what
-  // players read as the ball while avoiding the huge glow becoming a hitbox.
+  // Use the full solid green ball core, not the outer glow. If that visible
+  // core crosses the transparent paddle body, it should count.
   return Math.max(CONFIG.ball.radius, ballVisualWorldRadius(viewZ || 0) * CONFIG.ball.hitCoreScale);
 }
 
