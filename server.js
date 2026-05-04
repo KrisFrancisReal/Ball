@@ -7,23 +7,23 @@ const { WebSocketServer, WebSocket } = require('ws');
 
 const PORT = process.env.PORT || 3000;
 const HEARTBEAT_MS = 30000;
-const SIM_TICK_MS = 1000 / 60;
-const SIM_LOOP_MS = 8;
-const MAX_ACCUMULATOR_MS = 120;
-const MAX_SIM_STEPS = 8;
-const STATE_BROADCAST_MS = 16;
+const CLEANUP_MS = 60000;
+const LOBBY_TTL_MS = 15 * 60 * 1000;
+const FIXED_STEP_MS = 1000 / 60;
+const LOOP_MS = 4;
+const MAX_ACCUMULATOR_MS = 140;
+const MAX_STEPS_PER_LOOP = 10;
+const BROADCAST_MS = 1000 / 60;
 const MAX_MESSAGE_BYTES = 16000;
 const PLAYER_LIMIT = 2;
 
 const CONFIG = {
   court: { width: 800, height: 560, depth: 1800 },
-  // serveSpeedMultiplier raised 0.94 -> 1.10 so multiplayer serves match the
-  // punch of a single-player level-3 serve instead of feeling like level 1.
-  ball: { radius: 26, spinDecay: 0.985, maxSpeed: 1900, initialZSpeed: 700, serveSpeedMultiplier: 1.10, serveZ: 60 },
+  ball: { radius: 26, spinDecay: 0.985, maxSpeed: 1900, initialZSpeed: 700, serveZ: 60 },
   paddle: { width: 170, height: 130 },
-  scoreOverlayMs: 3000,
-  scoreFadeMs: 450,
-  timing: { playerBoostMultiplier: 1.065 },
+  physics: { substepThreshold: 18 },
+  timing: { playerBoostWindowMs: 140, playerBoostMultiplier: 1.065 },
+  score: { holdMs: 3000, fadeMs: 450 },
   shot: {
     hitGain: 1.04,
     serveEdgeKick: 310,
@@ -40,32 +40,13 @@ const CONFIG = {
     maxSpin: 2600
   },
   network: {
-    remotePaddleSlack: 18,
-    hitClaimGraceMs: 240,
-    hitClaimZWindow: 280,
-    hitClaimBallDriftLimit: 440,
-    hitClaimValidateSlack: 68
-  },
-  physics: { substepThreshold: 16 }
+    contactSlack: 22,
+    inputHistoryLimit: 8
+  }
 };
 
 let nextGameNumber = 1;
 const lobbies = new Map();
-
-const server = http.createServer((req, res) => {
-  res.writeHead(200, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Cache-Control': 'no-store'
-  });
-  res.end(JSON.stringify({
-    ok: true,
-    service: 'Mr Francis Ball WebSocket relay',
-    mode: 'server-authoritative-ball',
-    lobbies: lobbies.size
-  }));
-});
-
-const wss = new WebSocketServer({ server });
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const lerp = (a, b, t) => a + (b - a) * t;
@@ -81,21 +62,25 @@ function randomPin() {
   return String(min + Math.floor(Math.random() * (max - min + 1)));
 }
 
-function cleanWinScore(value) {
-  const n = Math.floor(Number(value));
-  if (!Number.isFinite(n)) return 10;
-  return Math.max(1, Math.min(99, n));
-}
-
-function cleanHostColour(value) {
-  const colour = String(value || '').toLowerCase();
-  return colour === 'red' || colour === 'blue' ? colour : null;
+function nowWall() {
+  return Date.now();
 }
 
 function cleanNumber(value, fallback = 0, min = -5000, max = 5000) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
-  return Math.max(min, Math.min(max, n));
+  return clamp(n, min, max);
+}
+
+function cleanWinScore(value) {
+  const n = Math.floor(Number(value));
+  if (!Number.isFinite(n)) return 10;
+  return clamp(n, 1, 99);
+}
+
+function cleanColour(value) {
+  const colour = String(value || '').toLowerCase();
+  return colour === 'red' || colour === 'blue' ? colour : null;
 }
 
 function send(ws, payload) {
@@ -107,8 +92,43 @@ function sendError(ws, message) {
   send(ws, { type: 'error', message });
 }
 
+function ballVisualWorldRadius(z) {
+  const depthT = clamp(1 - (z / CONFIG.court.depth), 0, 1);
+  return CONFIG.ball.radius * (0.95 + Math.pow(depthT, 1.25) * 2.1);
+}
+
+function humanPaddleHitRadius() {
+  return Math.max(CONFIG.ball.radius, ballVisualWorldRadius(0));
+}
+
+function makeBall(role = 'host') {
+  return {
+    x: 0,
+    y: 0,
+    z: role === 'guest' ? CONFIG.court.depth - CONFIG.ball.serveZ : CONFIG.ball.serveZ,
+    vx: 0,
+    vy: 0,
+    vz: 0,
+    spinX: 0,
+    spinY: 0
+  };
+}
+
+function cloneBall(ball) {
+  return {
+    x: cleanNumber(ball && ball.x),
+    y: cleanNumber(ball && ball.y),
+    z: cleanNumber(ball && ball.z, CONFIG.ball.serveZ, -500, CONFIG.court.depth + 500),
+    vx: cleanNumber(ball && ball.vx),
+    vy: cleanNumber(ball && ball.vy),
+    vz: cleanNumber(ball && ball.vz),
+    spinX: cleanNumber(ball && ball.spinX),
+    spinY: cleanNumber(ball && ball.spinY)
+  };
+}
+
 function ballSpeed(ball) {
-  return Math.hypot(ball.vx || 0, ball.vy || 0, ball.vz || 0);
+  return Math.sqrt(ball.vx * ball.vx + ball.vy * ball.vy + ball.vz * ball.vz);
 }
 
 function clampBallSpeed(ball) {
@@ -121,39 +141,17 @@ function clampBallSpeed(ball) {
   }
 }
 
-function ballVisualWorldRadius(z) {
-  const depthT = clamp(1 - (z / CONFIG.court.depth), 0, 1);
-  return CONFIG.ball.radius * (0.95 + Math.pow(depthT, 1.25) * 2.1);
-}
-
-function cloneBall(ball) {
-  return {
-    x: Number(ball && ball.x) || 0,
-    y: Number(ball && ball.y) || 0,
-    z: Number(ball && ball.z) || CONFIG.ball.serveZ,
-    vx: Number(ball && ball.vx) || 0,
-    vy: Number(ball && ball.vy) || 0,
-    vz: Number(ball && ball.vz) || 0,
-    spinX: Number(ball && ball.spinX) || 0,
-    spinY: Number(ball && ball.spinY) || 0
-  };
-}
-
-function cleanBallPayload(ball) {
-  return {
-    x: cleanNumber(ball && ball.x),
-    y: cleanNumber(ball && ball.y),
-    z: cleanNumber(ball && ball.z, CONFIG.ball.serveZ, -1000, 3000),
-    vx: cleanNumber(ball && ball.vx),
-    vy: cleanNumber(ball && ball.vy),
-    vz: cleanNumber(ball && ball.vz),
-    spinX: cleanNumber(ball && ball.spinX),
-    spinY: cleanNumber(ball && ball.spinY)
-  };
-}
-
 function makePaddle() {
   return { x: 0, y: 0, vx: 0, vy: 0 };
+}
+
+function clonePaddle(paddle) {
+  return {
+    x: cleanNumber(paddle && paddle.x),
+    y: cleanNumber(paddle && paddle.y),
+    vx: cleanNumber(paddle && paddle.vx, 0, -3200, 3200),
+    vy: cleanNumber(paddle && paddle.vy, 0, -3200, 3200)
+  };
 }
 
 function paddleBounds() {
@@ -161,24 +159,25 @@ function paddleBounds() {
   const hh = CONFIG.paddle.height / 2;
   return {
     minX: -CONFIG.court.width / 2 + hw,
-    maxX:  CONFIG.court.width / 2 - hw,
+    maxX: CONFIG.court.width / 2 - hw,
     minY: -CONFIG.court.height / 2 + hh,
-    maxY:  CONFIG.court.height / 2 - hh
+    maxY: CONFIG.court.height / 2 - hh
   };
 }
 
 function clampPaddle(paddle) {
-  const bounds = paddleBounds();
-  paddle.x = clamp(cleanNumber(paddle.x), bounds.minX, bounds.maxX);
-  paddle.y = clamp(cleanNumber(paddle.y), bounds.minY, bounds.maxY);
-  paddle.vx = cleanNumber(paddle.vx);
-  paddle.vy = cleanNumber(paddle.vy);
+  const b = paddleBounds();
+  paddle.x = clamp(cleanNumber(paddle.x), b.minX, b.maxX);
+  paddle.y = clamp(cleanNumber(paddle.y), b.minY, b.maxY);
+  paddle.vx = cleanNumber(paddle.vx, 0, -3200, 3200);
+  paddle.vy = cleanNumber(paddle.vy, 0, -3200, 3200);
+  return paddle;
 }
 
-function cleanInputSamples(samples) {
+function cleanSamples(samples) {
   if (!Array.isArray(samples)) return [];
-  return samples.slice(-8).map((sample) => ({
-    t: cleanNumber(sample && sample.t, Date.now(), 0, 9999999999999),
+  return samples.slice(-CONFIG.network.inputHistoryLimit).map((sample) => ({
+    t: cleanNumber(sample && sample.t, nowWall(), 0, 9999999999999),
     x: cleanNumber(sample && sample.x),
     y: cleanNumber(sample && sample.y),
     vx: cleanNumber(sample && sample.vx, 0, -3200, 3200),
@@ -186,7 +185,7 @@ function cleanInputSamples(samples) {
   }));
 }
 
-function strongestRecentVelocity(data, fallback) {
+function strongestVelocity(data, fallback) {
   const result = {
     vx: cleanNumber(fallback && fallback.vx, 0, -3200, 3200),
     vy: cleanNumber(fallback && fallback.vy, 0, -3200, 3200)
@@ -195,7 +194,7 @@ function strongestRecentVelocity(data, fallback) {
   const peakVY = cleanNumber(data && data.peakVY, 0, -3200, 3200);
   if (Math.abs(peakVX) > Math.abs(result.vx)) result.vx = peakVX;
   if (Math.abs(peakVY) > Math.abs(result.vy)) result.vy = peakVY;
-  for (const sample of cleanInputSamples(data && data.samples)) {
+  for (const sample of cleanSamples(data && data.samples)) {
     if (Math.abs(sample.vx) > Math.abs(result.vx)) result.vx = sample.vx;
     if (Math.abs(sample.vy) > Math.abs(result.vy)) result.vy = sample.vy;
   }
@@ -204,33 +203,84 @@ function strongestRecentVelocity(data, fallback) {
   return result;
 }
 
+function otherRole(role) {
+  return role === 'host' ? 'guest' : 'host';
+}
+
+function playerForRole(lobby, role) {
+  return lobby.players.find((player) => player.role === role) || null;
+}
+
+function colourForRole(lobby, role) {
+  const player = playerForRole(lobby, role);
+  return player && player.colour ? player.colour : (role === 'guest' ? 'blue' : 'red');
+}
+
+function roleForColour(lobby, colour) {
+  const player = lobby.players.find((item) => item.colour === colour);
+  if (player) return player.role;
+  return colour === 'blue' ? 'guest' : 'host';
+}
+
+function servingRole(lobby) {
+  return roleForColour(lobby, lobby.state.serveColor || 'red');
+}
+
 function lobbyStatus(lobby) {
-  if (!lobby) return 'Closed';
-  if (lobby.players.length >= PLAYER_LIMIT) return lobby.status === 'playing' ? 'Full' : 'Full';
+  if (lobby.players.length >= PLAYER_LIMIT) return 'Full';
   return 'Waiting';
 }
 
-function serializeState(state) {
-  return {
-    seq: state.seq || 0,
-    serverTime: Number(state.serverTime) || Date.now(),
-    simulationTime: Number(state.simulationTime) || 0,
-    tickTime: Number(state.tickTime) || 0,
-    eventSeq: Number(state.eventSeq) || 0,
-    roundSeq: Number(state.roundSeq) || 0,
-    roundState: state.roundState || 'serving',
-    serveColor: state.serveColor || 'red',
-    nextServeColor: state.nextServeColor || state.serveColor || 'red',
-    scores: {
-      red: Number(state.scores && state.scores.red) || 0,
-      blue: Number(state.scores && state.scores.blue) || 0
-    },
-    winScore: cleanWinScore(state.winScore),
-    winner: state.winner || null,
-    scoreEventSeq: Number(state.scoreEventSeq) || 0,
-    ball: cloneBall(state.ball),
-    event: state.event || { seq: 0, type: 'none', role: null }
+function makeEvent(lobby, type, role) {
+  lobby.eventSeq += 1;
+  lobby.state.event = {
+    seq: lobby.eventSeq,
+    type,
+    role: role || null,
+    serverTime: nowWall(),
+    simulationTime: lobby.simulationTime
   };
+  lobby.state.eventSeq = lobby.eventSeq;
+  lobby.forceBroadcast = true;
+}
+
+function initialState(lobby) {
+  lobby.eventSeq = 0;
+  lobby.roundSeq = 1;
+  return {
+    seq: 0,
+    serverTime: nowWall(),
+    simulationTime: 0,
+    tickTime: FIXED_STEP_MS / 1000,
+    eventSeq: 0,
+    roundSeq: lobby.roundSeq,
+    roundState: 'serving',
+    serveColor: 'red',
+    serveRole: roleForColour(lobby, 'red'),
+    nextServeColor: 'red',
+    scores: { red: 0, blue: 0 },
+    winScore: cleanWinScore(lobby.winScore),
+    scoreEventSeq: 0,
+    winner: null,
+    ball: makeBall(roleForColour(lobby, 'red')),
+    event: { seq: 0, type: 'none', role: null },
+    paddles: { host: makePaddle(), guest: makePaddle() }
+  };
+}
+
+function syncStatePaddles(lobby) {
+  const host = playerForRole(lobby, 'host');
+  const guest = playerForRole(lobby, 'guest');
+  lobby.state.paddles = {
+    host: host ? clonePaddle(host.paddle) : makePaddle(),
+    guest: guest ? clonePaddle(guest.paddle) : makePaddle()
+  };
+}
+
+function parkServeBall(lobby) {
+  const role = servingRole(lobby);
+  lobby.state.serveRole = role;
+  Object.assign(lobby.state.ball, makeBall(role));
 }
 
 function publicLobby(lobby) {
@@ -239,17 +289,15 @@ function publicLobby(lobby) {
     gameNumber: lobby.gameNumber,
     status: lobbyStatus(lobby),
     playerCount: lobby.players.length,
-    hostColour: lobby.hostColour || null,
     isPublic: !!lobby.isPublic,
     winScore: cleanWinScore(lobby.winScore),
+    hostColour: lobby.hostColour || null,
     createdAt: lobby.createdAt,
     updatedAt: lobby.updatedAt,
-    state: lobby.state ? serializeState(lobby.state) : null,
     players: lobby.players.map((player) => ({
       role: player.role,
       colour: player.colour || null,
-      connected: player.ws && player.ws.readyState === WebSocket.OPEN,
-      paddle: player.paddle
+      connected: player.ws && player.ws.readyState === WebSocket.OPEN
     }))
   };
 }
@@ -275,156 +323,93 @@ function broadcastLobbyList() {
   for (const client of wss.clients) send(client, payload);
 }
 
-function broadcastLobby(lobby, extra = {}) {
-  const payload = Object.assign({ type: 'lobbyUpdate', lobby: publicLobby(lobby) }, extra);
-  for (const player of lobby.players) send(player.ws, payload);
+function broadcastLobby(lobby) {
+  for (const player of lobby.players) {
+    send(player.ws, { type: 'lobbyUpdate', lobby: publicLobby(lobby) });
+  }
+}
+
+function snapshot(lobby) {
+  syncStatePaddles(lobby);
+  const state = lobby.state;
+  state.serverTime = nowWall();
+  state.simulationTime = lobby.simulationTime;
+  state.tickTime = FIXED_STEP_MS / 1000;
+  state.serveRole = servingRole(lobby);
+  state.winScore = cleanWinScore(lobby.winScore);
+  return {
+    seq: state.seq,
+    serverTime: state.serverTime,
+    simulationTime: state.simulationTime,
+    tickTime: state.tickTime,
+    eventSeq: state.eventSeq,
+    roundSeq: state.roundSeq,
+    roundState: state.roundState,
+    serveColor: state.serveColor,
+    serveRole: state.serveRole,
+    nextServeColor: state.nextServeColor,
+    scores: { red: state.scores.red || 0, blue: state.scores.blue || 0 },
+    winScore: state.winScore,
+    scoreEventSeq: state.scoreEventSeq || 0,
+    winner: state.winner || null,
+    ball: cloneBall(state.ball),
+    paddles: {
+      host: clonePaddle(state.paddles.host),
+      guest: clonePaddle(state.paddles.guest)
+    },
+    event: state.event || { seq: 0, type: 'none', role: null }
+  };
 }
 
 function broadcastState(lobby, force = false) {
-  if (!lobby || !lobby.state) return;
-  const now = Date.now();
-  // Bump seq once per call. Each call corresponds to one logical state
-  // version; a player who is gated for this tick will see seq jumps but
-  // their reconciler tolerates that fine. Per-player gating below means a
-  // 30 Hz mobile client doesn't get hammered with 62.5 Hz snapshots.
-  lobby.state.seq = (lobby.state.seq || 0) + 1;
-  lobby.state.serverTime = now;
-  lobby.state.simulationTime = Number(lobby.simulationTime) || 0;
-  lobby.state.tickTime = SIM_TICK_MS / 1000;
-  lobby.state.eventSeq = Number(lobby.eventSeq) || 0;
-  lobby.state.roundSeq = Number(lobby.roundSeq) || 0;
-  const payload = { type: 'gameState', state: serializeState(lobby.state) };
-  // Track lobby-wide broadcast time too, for any external code that may
-  // want it (and so the previous behavior is unchanged when no player has
-  // declared a custom interval).
-  let anySent = false;
+  if (!lobby.state) return;
+  const now = nowWall();
+  let sent = false;
   for (const player of lobby.players) {
-    const interval = player.broadcastIntervalMs || STATE_BROADCAST_MS;
+    const interval = player.broadcastIntervalMs || BROADCAST_MS;
     if (!force && now - (player.lastBroadcastAt || 0) < interval) continue;
+    if (!sent) {
+      lobby.state.seq += 1;
+      lobby.cachedSnapshot = snapshot(lobby);
+      sent = true;
+    }
     player.lastBroadcastAt = now;
-    send(player.ws, payload);
-    anySent = true;
+    send(player.ws, { type: 'gameState', state: lobby.cachedSnapshot });
   }
-  if (anySent) lobby.lastBroadcastAt = now;
+  if (sent) lobby.lastBroadcastAt = now;
 }
 
-function currentPlayer(ws) {
-  const lobby = ws.lobbyId ? lobbies.get(ws.lobbyId) : null;
-  if (!lobby) return { lobby: null, player: null };
-  return { lobby, player: lobby.players.find((p) => p.ws === ws) || null };
-}
-
-function playerForRole(lobby, role) {
-  return lobby.players.find((player) => player.role === role) || null;
-}
-
-function roleForColour(lobby, colour) {
-  const player = lobby.players.find((item) => item.colour === colour);
-  if (player) return player.role;
-  return colour === 'blue' ? 'guest' : 'host';
-}
-
-function colourForRole(lobby, role) {
-  const player = playerForRole(lobby, role);
-  return (player && player.colour) || (role === 'guest' ? 'blue' : 'red');
-}
-
-function servingRole(lobby) {
-  return roleForColour(lobby, lobby.state.serveColor || 'red');
-}
-
-function otherRole(role) {
-  return role === 'host' ? 'guest' : 'host';
-}
-
-function makeEvent(lobby, type, role) {
-  lobby.eventSeq = (lobby.eventSeq || 0) + 1;
-  if (type === 'serve' || type === 'score') lobby.roundSeq = (lobby.roundSeq || 0) + 1;
-  lobby.state.event = {
-    seq: lobby.eventSeq,
-    type,
-    role,
-    serverTime: Date.now(),
-    simulationTime: Number(lobby.simulationTime) || 0,
-    roundSeq: Number(lobby.roundSeq) || 0
-  };
-  lobby.state.eventSeq = lobby.eventSeq;
-  lobby.state.roundSeq = Number(lobby.roundSeq) || 0;
-  lobby.forceBroadcast = true;
-}
-
-function initialState(lobby) {
-  lobby.eventSeq = 0;
-  lobby.roundSeq = 0;
-  return {
-    seq: 0,
-    serverTime: Date.now(),
-    simulationTime: Number(lobby.simulationTime) || 0,
-    tickTime: SIM_TICK_MS / 1000,
-    eventSeq: 0,
-    roundSeq: 0,
-    roundState: 'serving',
-    serveColor: 'red',
-    nextServeColor: 'red',
-    scores: { red: 0, blue: 0 },
-    winScore: cleanWinScore(lobby.winScore),
-    winner: null,
-    scoreEventSeq: 0,
-    ball: cloneBall(null),
-    event: { seq: 0, type: 'none', role: null }
-  };
-}
-
-function parkServeBall(lobby) {
-  const role = servingRole(lobby);
-  const ball = lobby.state.ball;
-  ball.x = 0;
-  ball.y = 0;
-  ball.z = role === 'guest' ? CONFIG.court.depth - CONFIG.ball.serveZ : CONFIG.ball.serveZ;
-  ball.vx = 0;
-  ball.vy = 0;
-  ball.vz = 0;
-  ball.spinX = 0;
-  ball.spinY = 0;
-}
-
-function contactInfoFor(lobby, role, paddle, ball, extraSlack = 0) {
+function contactInfo(ball, paddle, extraSlack = 0) {
   const dx = ball.x - paddle.x;
   const dy = ball.y - paddle.y;
   const hw = CONFIG.paddle.width / 2;
   const hh = CONFIG.paddle.height / 2;
-  const r = Math.max(CONFIG.ball.radius, ballVisualWorldRadius(0));
-  const slack = (extraSlack || 0);
+  const r = humanPaddleHitRadius();
   const outsideX = Math.max(0, Math.abs(dx) - hw);
   const outsideY = Math.max(0, Math.abs(dy) - hh);
   return {
     paddle,
-    overlaps: Math.abs(dx) <= hw + r + slack && Math.abs(dy) <= hh + r + slack,
-    offsetX: clamp(dx / hw, -1.25, 1.25),
-    offsetY: clamp(dy / hh, -1.25, 1.25),
+    r,
+    overlaps: Math.abs(dx) <= hw + r + extraSlack && Math.abs(dy) <= hh + r + extraSlack,
+    offsetX: clamp(dx / Math.max(1, hw), -1.25, 1.25),
+    offsetY: clamp(dy / Math.max(1, hh), -1.25, 1.25),
     edge: clamp(Math.sqrt((dx / hw) * (dx / hw) + (dy / hh) * (dy / hh)) / 1.35, 0, 1),
     glancing: clamp(Math.max(outsideX, outsideY) / Math.max(1, r), 0, 1)
   };
 }
 
-function contactInfo(lobby, role, extraSlack = 0) {
-  const player = playerForRole(lobby, role);
-  return contactInfoFor(lobby, role, player ? player.paddle : makePaddle(), lobby.state.ball, extraSlack);
-}
-
-function applyPaddleShot(ball, role, isServe, contact) {
-  const paddle = contact.paddle;
+function applyPaddleShot(ball, paddle, isServe, contact) {
   const cappedVX = clamp(paddle.vx || 0, -2400, 2400);
   const cappedVY = clamp(paddle.vy || 0, -2400, 2400);
   const incomingVX = isServe ? 0 : ball.vx;
   const incomingVY = isServe ? 0 : ball.vy;
-
   const edgeKick = isServe
     ? CONFIG.shot.serveEdgeKick
     : CONFIG.shot.hitEdgeKick + contact.edge * CONFIG.shot.hitEdgeBonus;
   const moveKick = isServe ? CONFIG.shot.serveMoveKick : CONFIG.shot.hitMoveKick;
   const incomingDeflect = isServe ? 0 : contact.edge * CONFIG.shot.incomingDeflect;
   const controlLoss = 1 - contact.glancing * CONFIG.shot.glancingControlLoss;
+
   ball.vx = (ball.vx + contact.offsetX * edgeKick + cappedVX * moveKick + incomingVX * incomingDeflect) * controlLoss;
   ball.vy = (ball.vy + contact.offsetY * edgeKick + cappedVY * moveKick + incomingVY * incomingDeflect) * controlLoss;
 
@@ -439,9 +424,8 @@ function applyPaddleShot(ball, role, isServe, contact) {
   clampBallSpeed(ball);
 }
 
-function applyBoostIfActive(lobby, role) {
-  const player = playerForRole(lobby, role);
-  if (!player || !player.boostUntil || Date.now() > player.boostUntil) return;
+function applyBoostIfReady(lobby, player) {
+  if (!player.boostUntil || nowWall() > player.boostUntil) return;
   const ball = lobby.state.ball;
   ball.vx *= CONFIG.timing.playerBoostMultiplier;
   ball.vy *= CONFIG.timing.playerBoostMultiplier;
@@ -450,93 +434,97 @@ function applyBoostIfActive(lobby, role) {
   player.boostUntil = 0;
 }
 
-function applyPaddleHit(lobby, role, contact) {
-  const ball = lobby.state.ball;
+function applyPaddleHit(lobby, role, isServe, contact) {
+  const state = lobby.state;
+  const ball = state.ball;
+  const player = playerForRole(lobby, role);
   const dir = role === 'guest' ? -1 : 1;
-  const r = Math.max(CONFIG.ball.radius, ballVisualWorldRadius(0));
+  const r = contact.r;
+
   ball.z = role === 'guest' ? CONFIG.court.depth - r : r;
-  ball.vz = Math.abs(ball.vz) * dir;
-  const gain = CONFIG.shot.hitGain;
-  ball.vx *= gain;
-  ball.vy *= gain;
-  ball.vz *= gain;
+  if (isServe) {
+    ball.vx = 0;
+    ball.vy = 0;
+    ball.vz = CONFIG.ball.initialZSpeed * dir;
+    ball.spinX = 0;
+    ball.spinY = 0;
+  } else {
+    ball.vz = Math.abs(ball.vz) * dir;
+    ball.vx *= CONFIG.shot.hitGain;
+    ball.vy *= CONFIG.shot.hitGain;
+    ball.vz *= CONFIG.shot.hitGain;
+  }
   clampBallSpeed(ball);
-  applyPaddleShot(ball, role, false, contact);
-  applyBoostIfActive(lobby, role);
-  makeEvent(lobby, 'hit', role);
+  applyPaddleShot(ball, player ? player.paddle : contact.paddle, !!isServe, contact);
+  if (!isServe && player) applyBoostIfReady(lobby, player);
+
+  lobby.lastHitRole = role;
+  lobby.lastHitSimulationTime = lobby.simulationTime;
+  makeEvent(lobby, isServe ? 'serve' : 'hit', role);
 }
 
-function tryPaddleHit(lobby, role, slack = CONFIG.network.remotePaddleSlack) {
-  const info = contactInfo(lobby, role, slack);
-  if (!info.overlaps) return false;
-  applyPaddleHit(lobby, role, info);
+function tryPaddleHit(lobby, role, isServe = false) {
+  const player = playerForRole(lobby, role);
+  if (!player) return false;
+  const recentlySame = !isServe &&
+    lobby.lastHitRole === role &&
+    lobby.simulationTime - (lobby.lastHitSimulationTime || 0) < 80;
+  if (recentlySame) return false;
+  const contact = contactInfo(lobby.state.ball, player.paddle, CONFIG.network.contactSlack);
+  if (!contact.overlaps) return false;
+  applyPaddleHit(lobby, role, isServe, contact);
   return true;
 }
 
 function launchServe(lobby, role) {
-  if (!lobby.state || lobby.state.roundState !== 'serving') return;
+  const state = lobby.state;
+  if (!state || state.roundState !== 'serving') return;
   if (servingRole(lobby) !== role) return;
   parkServeBall(lobby);
-  const contact = contactInfo(lobby, role, CONFIG.network.remotePaddleSlack);
-  if (!contact.overlaps) return;
-  const ball = lobby.state.ball;
-  const dir = role === 'guest' ? -1 : 1;
-  ball.z = role === 'guest' ? CONFIG.court.depth - CONFIG.ball.serveZ : CONFIG.ball.serveZ;
-  ball.vz = CONFIG.ball.initialZSpeed * CONFIG.ball.serveSpeedMultiplier * dir;
-  ball.vx = 0;
-  ball.vy = 0;
-  ball.spinX = 0;
-  ball.spinY = 0;
-  applyPaddleShot(ball, role, true, contact);
-  lobby.state.roundState = 'playing';
-  makeEvent(lobby, 'serve', role);
-  broadcastState(lobby, true);
+  if (!tryPaddleHit(lobby, role, true)) return;
+  state.roundState = 'playing';
+  lobby.forceBroadcast = true;
 }
 
 function scorePoint(lobby, scorerRole) {
   const state = lobby.state;
-  const colour = colourForRole(lobby, scorerRole) || 'red';
+  const colour = colourForRole(lobby, scorerRole);
   state.scores[colour] = (state.scores[colour] || 0) + 1;
   state.scoreEventSeq = (state.scoreEventSeq || 0) + 1;
-  makeEvent(lobby, 'score', scorerRole);
-  const target = cleanWinScore(state.winScore || lobby.winScore);
-  if (state.scores[colour] >= target) {
-    state.winner = colour;
-    state.roundState = 'ended';
-    makeEvent(lobby, 'end', scorerRole);
-    return;
-  }
-  state.nextServeColor = (state.serveColor || 'red') === 'red' ? 'blue' : 'red';
-  state.roundState = 'scoreHold';
-  lobby.scoreGateUntil = Date.now() + CONFIG.scoreOverlayMs;
+  state.roundSeq += 1;
   state.ball.vx = 0;
   state.ball.vy = 0;
   state.ball.vz = 0;
   state.ball.spinX = 0;
   state.ball.spinY = 0;
+  makeEvent(lobby, 'score', scorerRole);
+
+  if (state.scores[colour] >= cleanWinScore(lobby.winScore)) {
+    state.winner = colour;
+    state.roundState = 'ended';
+    makeEvent(lobby, 'end', scorerRole);
+    return;
+  }
+
+  state.nextServeColor = state.serveColor === 'red' ? 'blue' : 'red';
+  state.roundState = 'scoreHold';
+  lobby.gateUntil = nowWall() + CONFIG.score.holdMs;
 }
 
-function queuePotentialMiss(lobby, missedRole, scorerRole) {
-  if (lobby.pendingMiss && lobby.pendingMiss.missedRole === missedRole) return;
-  const missBall = cloneBall(lobby.state.ball);
-  lobby.pendingMiss = {
-    missedRole,
-    scorerRole,
-    missBall,
-    until: Date.now() + CONFIG.network.hitClaimGraceMs
-  };
-}
-
-function positionAtCrossing(ball, prevX, prevY, prevZ, targetZ) {
-  const dz = ball.z - prevZ;
-  const t = Math.abs(dz) > 0.0001 ? clamp((targetZ - prevZ) / dz, 0, 1) : 1;
-  ball.x = lerp(prevX, ball.x, t);
-  ball.y = lerp(prevY, ball.y, t);
+function positionAtCrossing(ball, prev, targetZ) {
+  const dz = ball.z - prev.z;
+  const t = Math.abs(dz) > 0.0001 ? clamp((targetZ - prev.z) / dz, 0, 1) : 1;
+  ball.x = lerp(prev.x, ball.x, t);
+  ball.y = lerp(prev.y, ball.y, t);
   ball.z = targetZ;
 }
 
-function onWallCollision(lobby) {
-  makeEvent(lobby, 'wall', null);
+function wallBounce(lobby) {
+  const now = lobby.simulationTime;
+  if (now - (lobby.lastWallEventAt || 0) > 30) {
+    lobby.lastWallEventAt = now;
+    makeEvent(lobby, 'wall', null);
+  }
 }
 
 function subStepBall(lobby, dt) {
@@ -548,143 +536,103 @@ function subStepBall(lobby, dt) {
   ball.spinY *= decay;
   clampBallSpeed(ball);
 
-  const prevX = ball.x;
-  const prevY = ball.y;
-  const prevZ = ball.z;
+  const prev = { x: ball.x, y: ball.y, z: ball.z };
   ball.x += ball.vx * dt;
   ball.y += ball.vy * dt;
   ball.z += ball.vz * dt;
 
-  const w = CONFIG.court.width / 2 - CONFIG.ball.radius;
-  const h = CONFIG.court.height / 2 - CONFIG.ball.radius;
+  const W = CONFIG.court.width / 2 - CONFIG.ball.radius;
+  const H = CONFIG.court.height / 2 - CONFIG.ball.radius;
   let wallHit = false;
-  if (ball.x < -w) { ball.x = -w; ball.vx = Math.abs(ball.vx); wallHit = true; }
-  if (ball.x >  w) { ball.x =  w; ball.vx = -Math.abs(ball.vx); wallHit = true; }
-  if (ball.y < -h) { ball.y = -h; ball.vy = Math.abs(ball.vy); wallHit = true; }
-  if (ball.y >  h) { ball.y =  h; ball.vy = -Math.abs(ball.vy); wallHit = true; }
-  if (wallHit && !lobby.pendingMiss) onWallCollision(lobby);
+  if (ball.x < -W) { ball.x = -W; ball.vx = -ball.vx; wallHit = true; }
+  if (ball.x > W) { ball.x = W; ball.vx = -ball.vx; wallHit = true; }
+  if (ball.y < -H) { ball.y = -H; ball.vy = -ball.vy; wallHit = true; }
+  if (ball.y > H) { ball.y = H; ball.vy = -ball.vy; wallHit = true; }
+  if (wallHit) wallBounce(lobby);
 
-  const r = Math.max(CONFIG.ball.radius, ballVisualWorldRadius(0));
-  if (ball.vz < 0 && prevZ >= r && ball.z <= r) {
-    positionAtCrossing(ball, prevX, prevY, prevZ, r);
-    if (!tryPaddleHit(lobby, 'host')) queuePotentialMiss(lobby, 'host', 'guest');
+  const r = humanPaddleHitRadius();
+  if (ball.vz < 0 && prev.z >= r && ball.z <= r) {
+    positionAtCrossing(ball, prev, r);
+    if (!tryPaddleHit(lobby, 'host', false)) {
+      ball.z = 0;
+      scorePoint(lobby, 'guest');
+      return false;
+    }
   }
-  if (ball.vz > 0 && prevZ <= CONFIG.court.depth - r && ball.z >= CONFIG.court.depth - r) {
-    positionAtCrossing(ball, prevX, prevY, prevZ, CONFIG.court.depth - r);
-    if (!tryPaddleHit(lobby, 'guest')) queuePotentialMiss(lobby, 'guest', 'host');
+  if (ball.vz > 0 && prev.z <= CONFIG.court.depth - r && ball.z >= CONFIG.court.depth - r) {
+    positionAtCrossing(ball, prev, CONFIG.court.depth - r);
+    if (!tryPaddleHit(lobby, 'guest', false)) {
+      ball.z = CONFIG.court.depth;
+      scorePoint(lobby, 'host');
+      return false;
+    }
   }
+  return true;
 }
 
 function stepBall(lobby, dt) {
   const ball = lobby.state.ball;
-  const steps = Math.max(1, Math.ceil(ballSpeed(ball) * dt / CONFIG.physics.substepThreshold));
+  const stepSize = Math.max(8, CONFIG.ball.radius * 0.6);
+  const steps = Math.max(1, Math.ceil(ballSpeed(ball) * dt / stepSize));
   const sub = dt / steps;
-  for (let i = 0; i < steps; i++) subStepBall(lobby, sub);
+  for (let i = 0; i < steps; i++) {
+    if (!subStepBall(lobby, sub)) return;
+  }
 }
 
-function acceptHitClaim(lobby, player, data) {
-  if (!lobby.state || lobby.state.roundState !== 'playing' || lobby.state.winner) return false;
-  const role = player.role;
-  const ball = lobby.state.ball;
-  const r = Math.max(CONFIG.ball.radius, ballVisualWorldRadius(0));
-  const plane = role === 'guest' ? CONFIG.court.depth - r : r;
-  const pendingMiss = lobby.pendingMiss && lobby.pendingMiss.missedRole === role;
-  const movingToward = role === 'guest' ? ball.vz > 0 : ball.vz < 0;
-  const closeToPlane = Math.abs(ball.z - plane) <= CONFIG.network.hitClaimZWindow;
-  if (!pendingMiss && (!movingToward || !closeToPlane)) return false;
-
-  const claimedBall = cleanBallPayload(data.ball);
-  const claimedPaddle = {
-    x: cleanNumber(data.paddle && data.paddle.x),
-    y: cleanNumber(data.paddle && data.paddle.y),
-    vx: cleanNumber(data.paddle && data.paddle.vx),
-    vy: cleanNumber(data.paddle && data.paddle.vy)
-  };
-  const recent = strongestRecentVelocity(data, claimedPaddle);
-  claimedPaddle.vx = recent.vx;
-  claimedPaddle.vy = recent.vy;
-  clampPaddle(claimedPaddle);
-  player.paddle = claimedPaddle;
-  player.inputSamples = cleanInputSamples(data.samples);
-  player.inputTime = cleanNumber(data.inputTime, Date.now(), 0, 9999999999999);
-
-  const savedBall = cloneBall(ball);
-  if (Math.abs(claimedBall.x - ball.x) <= CONFIG.network.hitClaimBallDriftLimit &&
-      Math.abs(claimedBall.y - ball.y) <= CONFIG.network.hitClaimBallDriftLimit) {
-    ball.x = clamp(claimedBall.x, -CONFIG.court.width / 2, CONFIG.court.width / 2);
-    ball.y = clamp(claimedBall.y, -CONFIG.court.height / 2, CONFIG.court.height / 2);
-  }
-  ball.z = plane;
-  ball.vx = claimedBall.vx;
-  ball.vy = claimedBall.vy;
-  ball.vz = claimedBall.vz;
-  ball.spinX = claimedBall.spinX;
-  ball.spinY = claimedBall.spinY;
-  const contact = contactInfoFor(lobby, role, claimedPaddle, ball, CONFIG.network.hitClaimValidateSlack);
-  if (!contact.overlaps) {
-    Object.assign(ball, savedBall);
-    return false;
-  }
-
-  lobby.pendingMiss = null;
-  if (data.boost) player.boostUntil = Date.now() + 140;
-  applyPaddleHit(lobby, role, contact);
-  return true;
-}
-
-function simulateLobby(lobby, dt, now) {
-  if (lobby.status !== 'playing' || !lobby.state) return;
+function simulateLobby(lobby, dt) {
   const state = lobby.state;
+  if (!state || lobby.status !== 'playing' || state.winner) return;
+  const wallNow = nowWall();
 
-  if (state.winner) {
+  if (state.roundState === 'playing') {
+    stepBall(lobby, dt);
     return;
   }
 
-  if (lobby.pendingMiss && now >= lobby.pendingMiss.until) {
-    Object.assign(state.ball, lobby.pendingMiss.missBall);
-    const scorer = lobby.pendingMiss.scorerRole;
-    lobby.pendingMiss = null;
-    scorePoint(lobby, scorer);
-  } else if (state.roundState === 'scoreHold' || state.roundState === 'scoreFade') {
-    if (now >= lobby.scoreGateUntil) {
-      if (state.roundState === 'scoreHold') {
-        state.roundState = 'scoreFade';
-        lobby.scoreGateUntil = now + CONFIG.scoreFadeMs;
-        lobby.forceBroadcast = true;
-      } else {
-        state.roundState = 'serving';
-        state.serveColor = state.nextServeColor || state.serveColor || 'red';
-        parkServeBall(lobby);
-        lobby.forceBroadcast = true;
-      }
-    }
-  } else if (state.roundState === 'serving') {
+  if (state.roundState === 'serving') {
     parkServeBall(lobby);
-  } else if (state.roundState === 'playing') {
-    stepBall(lobby, dt);
+    return;
   }
 
+  if (state.roundState === 'scoreHold' && wallNow >= lobby.gateUntil) {
+    state.roundState = 'scoreFade';
+    lobby.gateUntil = wallNow + CONFIG.score.fadeMs;
+    lobby.forceBroadcast = true;
+    return;
+  }
+
+  if (state.roundState === 'scoreFade' && wallNow >= lobby.gateUntil) {
+    state.serveColor = state.nextServeColor || state.serveColor || 'red';
+    state.roundState = 'serving';
+    state.roundSeq += 1;
+    lobby.lastHitRole = null;
+    parkServeBall(lobby);
+    lobby.forceBroadcast = true;
+  }
 }
 
 function advanceLobby(lobby, elapsedMs) {
   if (lobby.status !== 'playing' || !lobby.state) return;
-  lobby.accumulatorMs = Math.min(
-    MAX_ACCUMULATOR_MS,
-    Math.max(0, Number(lobby.accumulatorMs) || 0) + Math.max(0, elapsedMs)
-  );
-  const wallNow = Date.now();
+  lobby.accumulatorMs = Math.min(MAX_ACCUMULATOR_MS, lobby.accumulatorMs + Math.max(0, elapsedMs));
   let steps = 0;
-  while (lobby.accumulatorMs >= SIM_TICK_MS && steps < MAX_SIM_STEPS) {
-    simulateLobby(lobby, SIM_TICK_MS / 1000, wallNow);
-    lobby.simulationTime = (Number(lobby.simulationTime) || 0) + SIM_TICK_MS;
-    lobby.accumulatorMs -= SIM_TICK_MS;
-    steps++;
+  while (lobby.accumulatorMs >= FIXED_STEP_MS && steps < MAX_STEPS_PER_LOOP) {
+    simulateLobby(lobby, FIXED_STEP_MS / 1000);
+    lobby.simulationTime += FIXED_STEP_MS;
+    lobby.accumulatorMs -= FIXED_STEP_MS;
+    steps += 1;
   }
-  if (steps >= MAX_SIM_STEPS) lobby.accumulatorMs = 0;
+  if (steps >= MAX_STEPS_PER_LOOP) lobby.accumulatorMs = 0;
   if (steps > 0 || lobby.forceBroadcast) {
     broadcastState(lobby, lobby.forceBroadcast);
     lobby.forceBroadcast = false;
   }
+}
+
+function currentPlayer(ws) {
+  const lobby = ws.lobbyId ? lobbies.get(ws.lobbyId) : null;
+  if (!lobby) return { lobby: null, player: null };
+  return { lobby, player: lobby.players.find((item) => item.ws === ws) || null };
 }
 
 function maybeStartLobby(lobby) {
@@ -692,25 +640,30 @@ function maybeStartLobby(lobby) {
   const host = playerForRole(lobby, 'host');
   const guest = playerForRole(lobby, 'guest');
   if (!host || !guest) return;
+
   host.colour = lobby.hostColour;
   guest.colour = lobby.hostColour === 'red' ? 'blue' : 'red';
   lobby.status = 'playing';
+  lobby.state = initialState(lobby);
   lobby.simulationTime = 0;
   lobby.accumulatorMs = 0;
-  lobby.state = initialState(lobby);
-  lobby.pendingMiss = null;
-  lobby.lastBroadcastAt = 0;
-  lobby.updatedAt = Date.now();
+  lobby.gateUntil = 0;
+  lobby.lastHitRole = null;
+  lobby.updatedAt = nowWall();
   parkServeBall(lobby);
-  const publicState = publicLobby(lobby);
+  syncStatePaddles(lobby);
+
+  const shared = publicLobby(lobby);
   for (const player of lobby.players) {
     send(player.ws, {
       type: 'startGame',
-      lobby: publicState,
+      lobby: shared,
+      gameNumber: lobby.gameNumber,
       role: player.role,
       colour: player.colour,
-      pin: lobby.isPublic ? null : lobby.pin,
+      opponentColour: player.colour === 'red' ? 'blue' : 'red',
       isPublic: !!lobby.isPublic,
+      pin: lobby.isPublic ? null : lobby.pin,
       winScore: cleanWinScore(lobby.winScore)
     });
   }
@@ -722,8 +675,7 @@ function leaveCurrentLobby(ws, reason = 'left') {
   const lobby = ws.lobbyId ? lobbies.get(ws.lobbyId) : null;
   if (!lobby) return;
   const index = lobby.players.findIndex((player) => player.ws === ws);
-  if (index === -1) return;
-
+  if (index < 0) return;
   const [removed] = lobby.players.splice(index, 1);
   ws.lobbyId = null;
   ws.role = null;
@@ -732,7 +684,7 @@ function leaveCurrentLobby(ws, reason = 'left') {
     send(player.ws, { type: 'opponentDisconnected', role: removed.role, reason });
   }
 
-  if (lobby.players.length === 0 || removed.role === 'host') {
+  if (!lobby.players.length || removed.role === 'host') {
     for (const player of lobby.players) {
       player.ws.lobbyId = null;
       player.ws.role = null;
@@ -742,33 +694,36 @@ function leaveCurrentLobby(ws, reason = 'left') {
   } else {
     lobby.status = 'waiting';
     lobby.state = null;
-    lobby.pendingMiss = null;
     lobby.accumulatorMs = 0;
-    lobby.updatedAt = Date.now();
+    lobby.simulationTime = 0;
+    lobby.updatedAt = nowWall();
     broadcastLobby(lobby);
   }
   broadcastLobbyList();
 }
 
-function handleCreateLobby(ws, data = {}) {
+function handleCreateLobby(ws, data) {
   leaveCurrentLobby(ws, 'new lobby');
   const isPublic = data.isPublic !== false;
-  const hostColour = cleanHostColour(data.hostColour);
+  const hostColour = cleanColour(data.hostColour) || 'red';
   const lobby = {
     lobbyId: randomId(8),
     gameNumber: nextGameNumber++,
     pin: isPublic ? null : randomPin(),
     isPublic,
     winScore: cleanWinScore(data.winScore),
-    players: [],
     hostColour,
+    players: [],
     status: 'waiting',
     state: null,
-    pendingMiss: null,
+    eventSeq: 0,
+    roundSeq: 0,
     simulationTime: 0,
     accumulatorMs: 0,
-    createdAt: Date.now(),
-    updatedAt: Date.now()
+    gateUntil: 0,
+    forceBroadcast: false,
+    createdAt: nowWall(),
+    updatedAt: nowWall()
   };
   const host = {
     ws,
@@ -776,8 +731,9 @@ function handleCreateLobby(ws, data = {}) {
     token: randomId(16),
     colour: hostColour,
     paddle: makePaddle(),
+    samples: [],
     boostUntil: 0,
-    lastSeen: Date.now()
+    lastSeen: nowWall()
   };
   lobby.players.push(host);
   lobbies.set(lobby.lobbyId, lobby);
@@ -790,8 +746,8 @@ function handleCreateLobby(ws, data = {}) {
     lobbyId: lobby.lobbyId,
     gameNumber: lobby.gameNumber,
     pin: lobby.pin,
-    isPublic: !!lobby.isPublic,
-    winScore: cleanWinScore(lobby.winScore),
+    isPublic,
+    winScore: lobby.winScore,
     role: 'host',
     token: host.token
   });
@@ -800,24 +756,24 @@ function handleCreateLobby(ws, data = {}) {
 
 function handleJoinLobby(ws, data) {
   const gameNumber = Number(data.gameNumber);
-  const pin = String(data.pin || '').trim();
   const lobby = [...lobbies.values()].find((item) => item.gameNumber === gameNumber);
   if (!lobby) return sendError(ws, 'Game not found');
   if (lobby.players.length >= PLAYER_LIMIT) return sendError(ws, 'Lobby is full');
-  if (!lobby.isPublic && pin !== lobby.pin) return sendError(ws, 'Wrong PIN');
+  if (!lobby.isPublic && String(data.pin || '').trim() !== lobby.pin) return sendError(ws, 'Wrong PIN');
 
   leaveCurrentLobby(ws, 'joining lobby');
   const guest = {
     ws,
     role: 'guest',
     token: randomId(16),
-    colour: lobby.hostColour ? (lobby.hostColour === 'red' ? 'blue' : 'red') : null,
+    colour: lobby.hostColour === 'red' ? 'blue' : 'red',
     paddle: makePaddle(),
+    samples: [],
     boostUntil: 0,
-    lastSeen: Date.now()
+    lastSeen: nowWall()
   };
   lobby.players.push(guest);
-  lobby.updatedAt = Date.now();
+  lobby.updatedAt = nowWall();
   ws.lobbyId = lobby.lobbyId;
   ws.role = 'guest';
 
@@ -828,7 +784,7 @@ function handleJoinLobby(ws, data) {
     gameNumber: lobby.gameNumber,
     pin: lobby.isPublic ? null : lobby.pin,
     isPublic: !!lobby.isPublic,
-    winScore: cleanWinScore(lobby.winScore),
+    winScore: lobby.winScore,
     role: 'guest',
     token: guest.token
   });
@@ -840,15 +796,21 @@ function handleJoinLobby(ws, data) {
 function handleSetColour(ws, data) {
   const { lobby, player } = currentPlayer(ws);
   if (!lobby || !player) return sendError(ws, 'Not in a lobby');
-  if (player.role !== 'host') return sendError(ws, 'Only the host can choose colour');
-  const colour = String(data.colour || '').toLowerCase();
-  if (colour !== 'red' && colour !== 'blue') return sendError(ws, 'Invalid colour');
-
+  if (player.role !== 'host') return sendError(ws, 'Only host can choose colour');
+  const colour = cleanColour(data.colour);
+  if (!colour) return sendError(ws, 'Invalid colour');
   lobby.hostColour = colour;
   for (const p of lobby.players) p.colour = p.role === 'host' ? colour : (colour === 'red' ? 'blue' : 'red');
-  lobby.updatedAt = Date.now();
+  lobby.updatedAt = nowWall();
   broadcastLobby(lobby);
   maybeStartLobby(lobby);
+}
+
+function handleClientHello(ws, data) {
+  const { player } = currentPlayer(ws);
+  if (!player) return;
+  const requested = Math.floor(Number(data.intervalMs));
+  if (Number.isFinite(requested)) player.broadcastIntervalMs = clamp(requested, 16, 100);
 }
 
 function handlePaddle(ws, data) {
@@ -857,74 +819,32 @@ function handlePaddle(ws, data) {
   const paddle = {
     x: cleanNumber(data.x),
     y: cleanNumber(data.y),
-    vx: cleanNumber(data.vx),
-    vy: cleanNumber(data.vy)
+    vx: cleanNumber(data.vx, 0, -3200, 3200),
+    vy: cleanNumber(data.vy, 0, -3200, 3200)
   };
-  const recent = strongestRecentVelocity(data, paddle);
-  paddle.vx = recent.vx;
-  paddle.vy = recent.vy;
+  const strongest = strongestVelocity(data, paddle);
+  paddle.vx = strongest.vx;
+  paddle.vy = strongest.vy;
+  clampPaddle(paddle);
   player.paddle = paddle;
-  clampPaddle(player.paddle);
-  player.inputSamples = cleanInputSamples(data.samples);
-  player.inputTime = cleanNumber(data.inputTime, Date.now(), 0, 9999999999999);
-  player.lastSeen = Date.now();
-  if (data.boost) player.boostUntil = Date.now() + 140;
+  player.samples = cleanSamples(data.samples);
+  player.lastSeen = nowWall();
   lobby.updatedAt = player.lastSeen;
 
-  for (const target of lobby.players) {
-    if (target.ws === ws) continue;
-    send(target.ws, {
-      type: 'paddle',
-      role: player.role,
-      x: player.paddle.x,
-      y: player.paddle.y,
-      vx: player.paddle.vx,
-      vy: player.paddle.vy,
-      boost: !!data.boost,
-      seq: Number(data.seq) || 0
-    });
-  }
-
+  if (data.boost) player.boostUntil = nowWall() + CONFIG.timing.playerBoostWindowMs;
   if (data.serve) launchServe(lobby, player.role);
-}
-
-function handleHitClaim(ws, data) {
-  const { lobby, player } = currentPlayer(ws);
-  if (!lobby || !player) return;
-  player.lastSeen = Date.now();
-  lobby.updatedAt = player.lastSeen;
-  if (acceptHitClaim(lobby, player, data)) broadcastState(lobby, true);
-}
-
-function handleGameState(ws, data) {
-  // Ball, score, and round state are server-authoritative now. Keep this
-  // handler as a harmless no-op so older clients do not break the relay.
-  void ws;
-  void data;
-}
-
-// Client declares its desired snapshot interval. Mobile clients running at
-// ~30 Hz can ask the server to throttle to that rate, halving network and
-// reconciliation overhead. Defaults clamped to [16, 200] ms (62.5–5 Hz).
-function handleClientHello(ws, data) {
-  const { player } = currentPlayer(ws);
-  if (!player) return;
-  const requested = Math.floor(Number(data && data.intervalMs));
-  if (!Number.isFinite(requested)) return;
-  player.broadcastIntervalMs = Math.max(16, Math.min(200, requested));
 }
 
 function handleReplay(ws) {
   const { lobby, player } = currentPlayer(ws);
-  if (!lobby || !player) return;
+  if (!lobby || !player || lobby.players.length !== PLAYER_LIMIT) return;
   lobby.state = initialState(lobby);
-  lobby.pendingMiss = null;
   lobby.simulationTime = 0;
   lobby.accumulatorMs = 0;
-  lobby.lastBroadcastAt = 0;
-  lobby.status = lobby.players.length === PLAYER_LIMIT ? 'playing' : 'waiting';
+  lobby.gateUntil = 0;
+  lobby.lastHitRole = null;
+  lobby.forceBroadcast = true;
   parkServeBall(lobby);
-  lobby.updatedAt = Date.now();
   for (const p of lobby.players) send(p.ws, { type: 'replay', requestedBy: player.role, lobby: publicLobby(lobby) });
   broadcastState(lobby, true);
 }
@@ -937,6 +857,7 @@ function handleMessage(ws, raw) {
   } catch (err) {
     return sendError(ws, 'Invalid JSON');
   }
+
   switch (data.type) {
     case 'listLobbies':
       send(ws, { type: 'lobbyList', lobbies: lobbyList() });
@@ -950,17 +871,11 @@ function handleMessage(ws, raw) {
     case 'setColour':
       handleSetColour(ws, data);
       break;
-    case 'paddle':
-      handlePaddle(ws, data);
-      break;
-    case 'hitClaim':
-      handleHitClaim(ws, data);
-      break;
-    case 'gameState':
-      handleGameState(ws, data);
-      break;
     case 'clientHello':
       handleClientHello(ws, data);
+      break;
+    case 'paddle':
+      handlePaddle(ws, data);
       break;
     case 'replay':
       handleReplay(ws);
@@ -970,35 +885,46 @@ function handleMessage(ws, raw) {
       send(ws, { type: 'leftLobby' });
       break;
     case 'ping':
-      // Echo the client's timestamp so it can measure true round-trip time.
-      // Falls back to server time for older clients that didn't send `t`.
-      send(ws, { type: 'pong', t: Number(data.t) || Date.now(), serverTime: Date.now() });
+      send(ws, { type: 'pong', t: Number(data.t) || 0, serverTime: nowWall() });
       break;
     default:
       sendError(ws, 'Unknown message type');
   }
 }
 
+const server = http.createServer((req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store'
+  });
+  res.end(JSON.stringify({
+    ok: true,
+    service: 'Mr Francis Ball multiplayer relay',
+    transport: 'WebSocket',
+    lobbies: lobbies.size
+  }));
+});
+
+const wss = new WebSocketServer({ server });
+
 wss.on('connection', (ws) => {
   ws.isAlive = true;
   ws.lobbyId = null;
   ws.role = null;
-  ws.on('pong', () => {
-    ws.isAlive = true;
-  });
+  ws.on('pong', () => { ws.isAlive = true; });
   ws.on('message', (raw) => handleMessage(ws, raw));
   ws.on('close', () => leaveCurrentLobby(ws, 'disconnected'));
   ws.on('error', () => leaveCurrentLobby(ws, 'connection error'));
   send(ws, { type: 'connected', lobbies: lobbyList() });
 });
 
-let lastSimulationLoopAt = performance.now();
+let lastLoopAt = performance.now();
 setInterval(() => {
   const now = performance.now();
-  const elapsedMs = Math.min(MAX_ACCUMULATOR_MS, Math.max(0, now - lastSimulationLoopAt));
-  lastSimulationLoopAt = now;
-  for (const lobby of lobbies.values()) advanceLobby(lobby, elapsedMs);
-}, SIM_LOOP_MS);
+  const elapsed = Math.min(MAX_ACCUMULATOR_MS, Math.max(0, now - lastLoopAt));
+  lastLoopAt = now;
+  for (const lobby of lobbies.values()) advanceLobby(lobby, elapsed);
+}, LOOP_MS);
 
 setInterval(() => {
   for (const ws of wss.clients) {
@@ -1012,6 +938,20 @@ setInterval(() => {
   }
 }, HEARTBEAT_MS);
 
+setInterval(() => {
+  const cutoff = nowWall() - LOBBY_TTL_MS;
+  for (const lobby of lobbies.values()) {
+    if (lobby.updatedAt >= cutoff) continue;
+    for (const player of lobby.players) {
+      send(player.ws, { type: 'lobbyClosed', reason: 'inactive' });
+      player.ws.lobbyId = null;
+      player.ws.role = null;
+    }
+    lobbies.delete(lobby.lobbyId);
+  }
+  broadcastLobbyList();
+}, CLEANUP_MS);
+
 server.listen(PORT, () => {
-  console.log(`Mr Francis Ball WebSocket relay listening on ${PORT}`);
+  console.log(`Mr Francis Ball multiplayer relay listening on ${PORT}`);
 });
