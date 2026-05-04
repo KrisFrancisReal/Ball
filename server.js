@@ -19,7 +19,7 @@ const PLAYER_LIMIT = 2;
 
 const CONFIG = {
   court: { width: 800, height: 560, depth: 1800 },
-  ball: { radius: 26, spinDecay: 0.985, maxSpeed: 1900, initialZSpeed: 700, serveZ: 60 },
+  ball: { radius: 26, spinDecay: 0.985, maxSpeed: 1900, initialZSpeed: 700, serveZ: 60, hitCoreScale: 0.64 },
   paddle: { width: 170, height: 130 },
   physics: { substepThreshold: 18 },
   timing: { playerBoostWindowMs: 140, playerBoostMultiplier: 1.065 },
@@ -101,10 +101,13 @@ function ballVisualWorldRadius(z) {
 }
 
 function humanPaddleHitRadius() {
-  // Collision uses the real physics ball radius, not the enlarged perspective
-  // render radius. The near-camera ball can look dramatic without its glow
-  // acting like a huge invisible hitbox.
-  return CONFIG.ball.radius;
+  return collisionWorldRadius(0);
+}
+
+function collisionWorldRadius(viewZ) {
+  // Use the solid visible ball core, not the outer glow. This matches what
+  // players read as the ball while avoiding the huge glow becoming a hitbox.
+  return Math.max(CONFIG.ball.radius, ballVisualWorldRadius(viewZ || 0) * CONFIG.ball.hitCoreScale);
 }
 
 function makeBall(role = 'host') {
@@ -386,12 +389,13 @@ function broadcastState(lobby, force = false) {
   if (sent) lobby.lastBroadcastAt = now;
 }
 
-function contactInfo(ball, paddle, extraSlack = 0) {
+function contactInfo(ball, paddle, extraSlack = 0, role = 'host') {
   const dx = ball.x - paddle.x;
   const dy = ball.y - paddle.y;
   const hw = CONFIG.paddle.width / 2;
   const hh = CONFIG.paddle.height / 2;
-  const r = humanPaddleHitRadius();
+  const viewZ = role === 'guest' ? CONFIG.court.depth - ball.z : ball.z;
+  const r = collisionWorldRadius(viewZ);
   const closestX = clamp(dx, -hw, hw);
   const closestY = clamp(dy, -hh, hh);
   const sepX = dx - closestX;
@@ -446,10 +450,10 @@ function sampledPaddlesFor(player) {
   return paddles;
 }
 
-function bestContactInfo(player, ball, extraSlack = 0) {
+function bestContactInfo(player, ball, extraSlack = 0, role = 'host') {
   let best = null;
   for (const paddle of sampledPaddlesFor(player)) {
-    const contact = contactInfo(ball, paddle, extraSlack);
+    const contact = contactInfo(ball, paddle, extraSlack, role);
     if (!contact.overlaps) continue;
     if (!best || contact.outsideDistance < best.outsideDistance) best = contact;
   }
@@ -531,8 +535,8 @@ function tryPaddleHit(lobby, role, isServe = false) {
   if (recentlySame) return false;
   const slack = isServe ? CONFIG.network.serveContactSlack : CONFIG.network.sampledContactSlack;
   const contact = isServe
-    ? contactInfo(lobby.state.ball, player.paddle, slack)
-    : bestContactInfo(player, lobby.state.ball, slack);
+    ? contactInfo(lobby.state.ball, player.paddle, slack, role)
+    : bestContactInfo(player, lobby.state.ball, slack, role);
   if (!contact || !contact.overlaps) return false;
   applyPaddleHit(lobby, role, isServe, contact);
   return true;
