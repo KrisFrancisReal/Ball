@@ -2,11 +2,15 @@
 
 const http = require('http');
 const crypto = require('crypto');
+const { performance } = require('perf_hooks');
 const { WebSocketServer, WebSocket } = require('ws');
 
 const PORT = process.env.PORT || 3000;
 const HEARTBEAT_MS = 30000;
-const SIM_TICK_MS = 16;
+const SIM_TICK_MS = 1000 / 60;
+const SIM_LOOP_MS = 8;
+const MAX_ACCUMULATOR_MS = 120;
+const MAX_SIM_STEPS = 8;
 const STATE_BROADCAST_MS = 16;
 const MAX_MESSAGE_BYTES = 16000;
 const PLAYER_LIMIT = 2;
@@ -171,6 +175,35 @@ function clampPaddle(paddle) {
   paddle.vy = cleanNumber(paddle.vy);
 }
 
+function cleanInputSamples(samples) {
+  if (!Array.isArray(samples)) return [];
+  return samples.slice(-8).map((sample) => ({
+    t: cleanNumber(sample && sample.t, Date.now(), 0, 9999999999999),
+    x: cleanNumber(sample && sample.x),
+    y: cleanNumber(sample && sample.y),
+    vx: cleanNumber(sample && sample.vx, 0, -3200, 3200),
+    vy: cleanNumber(sample && sample.vy, 0, -3200, 3200)
+  }));
+}
+
+function strongestRecentVelocity(data, fallback) {
+  const result = {
+    vx: cleanNumber(fallback && fallback.vx, 0, -3200, 3200),
+    vy: cleanNumber(fallback && fallback.vy, 0, -3200, 3200)
+  };
+  const peakVX = cleanNumber(data && data.peakVX, 0, -3200, 3200);
+  const peakVY = cleanNumber(data && data.peakVY, 0, -3200, 3200);
+  if (Math.abs(peakVX) > Math.abs(result.vx)) result.vx = peakVX;
+  if (Math.abs(peakVY) > Math.abs(result.vy)) result.vy = peakVY;
+  for (const sample of cleanInputSamples(data && data.samples)) {
+    if (Math.abs(sample.vx) > Math.abs(result.vx)) result.vx = sample.vx;
+    if (Math.abs(sample.vy) > Math.abs(result.vy)) result.vy = sample.vy;
+  }
+  result.vx = cleanNumber(result.vx, 0, -2400, 2400);
+  result.vy = cleanNumber(result.vy, 0, -2400, 2400);
+  return result;
+}
+
 function lobbyStatus(lobby) {
   if (!lobby) return 'Closed';
   if (lobby.players.length >= PLAYER_LIMIT) return lobby.status === 'playing' ? 'Full' : 'Full';
@@ -180,6 +213,11 @@ function lobbyStatus(lobby) {
 function serializeState(state) {
   return {
     seq: state.seq || 0,
+    serverTime: Number(state.serverTime) || Date.now(),
+    simulationTime: Number(state.simulationTime) || 0,
+    tickTime: Number(state.tickTime) || 0,
+    eventSeq: Number(state.eventSeq) || 0,
+    roundSeq: Number(state.roundSeq) || 0,
     roundState: state.roundState || 'serving',
     serveColor: state.serveColor || 'red',
     nextServeColor: state.nextServeColor || state.serveColor || 'red',
@@ -250,6 +288,11 @@ function broadcastState(lobby, force = false) {
   // their reconciler tolerates that fine. Per-player gating below means a
   // 30 Hz mobile client doesn't get hammered with 62.5 Hz snapshots.
   lobby.state.seq = (lobby.state.seq || 0) + 1;
+  lobby.state.serverTime = now;
+  lobby.state.simulationTime = Number(lobby.simulationTime) || 0;
+  lobby.state.tickTime = SIM_TICK_MS / 1000;
+  lobby.state.eventSeq = Number(lobby.eventSeq) || 0;
+  lobby.state.roundSeq = Number(lobby.roundSeq) || 0;
   const payload = { type: 'gameState', state: serializeState(lobby.state) };
   // Track lobby-wide broadcast time too, for any external code that may
   // want it (and so the previous behavior is unchanged when no player has
@@ -296,14 +339,30 @@ function otherRole(role) {
 
 function makeEvent(lobby, type, role) {
   lobby.eventSeq = (lobby.eventSeq || 0) + 1;
-  lobby.state.event = { seq: lobby.eventSeq, type, role };
+  if (type === 'serve' || type === 'score') lobby.roundSeq = (lobby.roundSeq || 0) + 1;
+  lobby.state.event = {
+    seq: lobby.eventSeq,
+    type,
+    role,
+    serverTime: Date.now(),
+    simulationTime: Number(lobby.simulationTime) || 0,
+    roundSeq: Number(lobby.roundSeq) || 0
+  };
+  lobby.state.eventSeq = lobby.eventSeq;
+  lobby.state.roundSeq = Number(lobby.roundSeq) || 0;
   lobby.forceBroadcast = true;
 }
 
 function initialState(lobby) {
   lobby.eventSeq = 0;
+  lobby.roundSeq = 0;
   return {
     seq: 0,
+    serverTime: Date.now(),
+    simulationTime: Number(lobby.simulationTime) || 0,
+    tickTime: SIM_TICK_MS / 1000,
+    eventSeq: 0,
+    roundSeq: 0,
     roundState: 'serving',
     serveColor: 'red',
     nextServeColor: 'red',
@@ -460,14 +519,6 @@ function scorePoint(lobby, scorerRole) {
 function queuePotentialMiss(lobby, missedRole, scorerRole) {
   if (lobby.pendingMiss && lobby.pendingMiss.missedRole === missedRole) return;
   const missBall = cloneBall(lobby.state.ball);
-  const ball = lobby.state.ball;
-  const dir = missedRole === 'guest' ? -1 : 1;
-  const r = Math.max(CONFIG.ball.radius, ballVisualWorldRadius(0));
-  ball.z = missedRole === 'guest' ? CONFIG.court.depth - r : r;
-  ball.vz = Math.abs(ball.vz) * dir;
-  ball.vx *= 0.985;
-  ball.vy *= 0.985;
-  clampBallSpeed(ball);
   lobby.pendingMiss = {
     missedRole,
     scorerRole,
@@ -549,8 +600,13 @@ function acceptHitClaim(lobby, player, data) {
     vx: cleanNumber(data.paddle && data.paddle.vx),
     vy: cleanNumber(data.paddle && data.paddle.vy)
   };
+  const recent = strongestRecentVelocity(data, claimedPaddle);
+  claimedPaddle.vx = recent.vx;
+  claimedPaddle.vy = recent.vy;
   clampPaddle(claimedPaddle);
   player.paddle = claimedPaddle;
+  player.inputSamples = cleanInputSamples(data.samples);
+  player.inputTime = cleanNumber(data.inputTime, Date.now(), 0, 9999999999999);
 
   const savedBall = cloneBall(ball);
   if (Math.abs(claimedBall.x - ball.x) <= CONFIG.network.hitClaimBallDriftLimit &&
@@ -576,16 +632,11 @@ function acceptHitClaim(lobby, player, data) {
   return true;
 }
 
-function tickLobby(lobby, now) {
+function simulateLobby(lobby, dt, now) {
   if (lobby.status !== 'playing' || !lobby.state) return;
   const state = lobby.state;
-  const last = lobby.lastTickAt || now;
-  const dt = Math.min(0.05, Math.max(0, (now - last) / 1000));
-  lobby.lastTickAt = now;
 
   if (state.winner) {
-    broadcastState(lobby, lobby.forceBroadcast);
-    lobby.forceBroadcast = false;
     return;
   }
 
@@ -613,8 +664,27 @@ function tickLobby(lobby, now) {
     stepBall(lobby, dt);
   }
 
-  broadcastState(lobby, lobby.forceBroadcast);
-  lobby.forceBroadcast = false;
+}
+
+function advanceLobby(lobby, elapsedMs) {
+  if (lobby.status !== 'playing' || !lobby.state) return;
+  lobby.accumulatorMs = Math.min(
+    MAX_ACCUMULATOR_MS,
+    Math.max(0, Number(lobby.accumulatorMs) || 0) + Math.max(0, elapsedMs)
+  );
+  const wallNow = Date.now();
+  let steps = 0;
+  while (lobby.accumulatorMs >= SIM_TICK_MS && steps < MAX_SIM_STEPS) {
+    simulateLobby(lobby, SIM_TICK_MS / 1000, wallNow);
+    lobby.simulationTime = (Number(lobby.simulationTime) || 0) + SIM_TICK_MS;
+    lobby.accumulatorMs -= SIM_TICK_MS;
+    steps++;
+  }
+  if (steps >= MAX_SIM_STEPS) lobby.accumulatorMs = 0;
+  if (steps > 0 || lobby.forceBroadcast) {
+    broadcastState(lobby, lobby.forceBroadcast);
+    lobby.forceBroadcast = false;
+  }
 }
 
 function maybeStartLobby(lobby) {
@@ -625,9 +695,10 @@ function maybeStartLobby(lobby) {
   host.colour = lobby.hostColour;
   guest.colour = lobby.hostColour === 'red' ? 'blue' : 'red';
   lobby.status = 'playing';
+  lobby.simulationTime = 0;
+  lobby.accumulatorMs = 0;
   lobby.state = initialState(lobby);
   lobby.pendingMiss = null;
-  lobby.lastTickAt = Date.now();
   lobby.lastBroadcastAt = 0;
   lobby.updatedAt = Date.now();
   parkServeBall(lobby);
@@ -672,6 +743,7 @@ function leaveCurrentLobby(ws, reason = 'left') {
     lobby.status = 'waiting';
     lobby.state = null;
     lobby.pendingMiss = null;
+    lobby.accumulatorMs = 0;
     lobby.updatedAt = Date.now();
     broadcastLobby(lobby);
   }
@@ -693,6 +765,8 @@ function handleCreateLobby(ws, data = {}) {
     status: 'waiting',
     state: null,
     pendingMiss: null,
+    simulationTime: 0,
+    accumulatorMs: 0,
     createdAt: Date.now(),
     updatedAt: Date.now()
   };
@@ -780,13 +854,19 @@ function handleSetColour(ws, data) {
 function handlePaddle(ws, data) {
   const { lobby, player } = currentPlayer(ws);
   if (!lobby || !player) return;
-  player.paddle = {
+  const paddle = {
     x: cleanNumber(data.x),
     y: cleanNumber(data.y),
     vx: cleanNumber(data.vx),
     vy: cleanNumber(data.vy)
   };
+  const recent = strongestRecentVelocity(data, paddle);
+  paddle.vx = recent.vx;
+  paddle.vy = recent.vy;
+  player.paddle = paddle;
   clampPaddle(player.paddle);
+  player.inputSamples = cleanInputSamples(data.samples);
+  player.inputTime = cleanNumber(data.inputTime, Date.now(), 0, 9999999999999);
   player.lastSeen = Date.now();
   if (data.boost) player.boostUntil = Date.now() + 140;
   lobby.updatedAt = player.lastSeen;
@@ -839,7 +919,8 @@ function handleReplay(ws) {
   if (!lobby || !player) return;
   lobby.state = initialState(lobby);
   lobby.pendingMiss = null;
-  lobby.lastTickAt = Date.now();
+  lobby.simulationTime = 0;
+  lobby.accumulatorMs = 0;
   lobby.lastBroadcastAt = 0;
   lobby.status = lobby.players.length === PLAYER_LIMIT ? 'playing' : 'waiting';
   parkServeBall(lobby);
@@ -911,10 +992,13 @@ wss.on('connection', (ws) => {
   send(ws, { type: 'connected', lobbies: lobbyList() });
 });
 
+let lastSimulationLoopAt = performance.now();
 setInterval(() => {
-  const now = Date.now();
-  for (const lobby of lobbies.values()) tickLobby(lobby, now);
-}, SIM_TICK_MS);
+  const now = performance.now();
+  const elapsedMs = Math.min(MAX_ACCUMULATOR_MS, Math.max(0, now - lastSimulationLoopAt));
+  lastSimulationLoopAt = now;
+  for (const lobby of lobbies.values()) advanceLobby(lobby, elapsedMs);
+}, SIM_LOOP_MS);
 
 setInterval(() => {
   for (const ws of wss.clients) {
